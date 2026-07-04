@@ -5402,6 +5402,7 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "device_code_exhausted"
         assert context["message"] == "Weekly credits exhausted."
         assert context["reset_at"] == "2026-04-12T10:30:00Z"
+        assert context["reset_source"] == "body_reset"
 
     def test_extract_api_error_context_uses_type_as_reason(self, agent):
         error = SimpleNamespace(
@@ -5418,6 +5419,28 @@ class TestCredentialPoolRecovery:
 
         assert context["reason"] == "usage_limit_reached"
         assert context["message"] == "The usage limit has been reached"
+
+    def test_extract_api_error_context_marks_retry_after_source(self, agent, monkeypatch):
+        from agent import agent_runtime_helpers
+
+        monkeypatch.setattr(agent_runtime_helpers.time, "time", lambda: 1_000.0)
+        response = SimpleNamespace(headers={"Retry-After": "120"})
+        error = SimpleNamespace(
+            body={
+                "error": {
+                    "code": "usage_limit_reached",
+                    "message": "You hit your usage limit.",
+                    "resets_at": "2026-04-12T10:30:00Z",
+                }
+            },
+            response=response,
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reason"] == "usage_limit_reached"
+        assert context["reset_at"] == 1_120.0
+        assert context["reset_source"] == "retry_after"
 
     def test_extract_api_error_context_parses_resets_in_hours_and_minutes(self, agent, monkeypatch):
         from agent import agent_runtime_helpers
@@ -5437,6 +5460,7 @@ class TestCredentialPoolRecovery:
 
         assert context["reason"] == "GoUsageLimitError"
         assert context["reset_at"] == 1_000.0 + (6 * 60 * 60) + (29 * 60)
+        assert context["reset_source"] == "message"
 
     def test_recover_with_pool_passes_error_context_on_rotated_429(self, agent):
         next_entry = SimpleNamespace(label="secondary")

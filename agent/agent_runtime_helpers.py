@@ -2468,11 +2468,13 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             value = payload.get(key)
             if value not in {None, ""}:
                 context["reset_at"] = value
+                context["reset_source"] = "body_reset"
                 break
         retry_after = payload.get("retry_after")
-        if retry_after not in {None, ""} and "reset_at" not in context:
+        if retry_after not in {None, ""}:
             try:
                 context["reset_at"] = time.time() + float(retry_after)
+                context["reset_source"] = "retry_after"
             except (TypeError, ValueError):
                 pass
 
@@ -2480,14 +2482,16 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
     headers = getattr(response, "headers", None)
     if headers:
         retry_after = headers.get("retry-after") or headers.get("Retry-After")
-        if retry_after and "reset_at" not in context:
+        if retry_after:
             try:
                 context["reset_at"] = time.time() + float(retry_after)
+                context["reset_source"] = "retry_after"
             except (TypeError, ValueError):
                 pass
         ratelimit_reset = headers.get("x-ratelimit-reset")
-        if ratelimit_reset and "reset_at" not in context:
+        if ratelimit_reset and context.get("reset_source") != "retry_after":
             context["reset_at"] = ratelimit_reset
+            context["reset_source"] = "rate_limit_header"
 
     if "message" not in context:
         raw_message = str(error).strip()
@@ -2502,6 +2506,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                 value = float(delay_match.group(1))
                 seconds = value / 1000.0 if delay_match.group(2).lower() == "ms" else value
                 context["reset_at"] = time.time() + seconds
+                context["reset_source"] = "message"
             else:
                 resets_in_match = re.search(
                     r"resets?\s+in\s+"
@@ -2516,6 +2521,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                     minutes = float(resets_in_match.group(2) or 0)
                     seconds = float(resets_in_match.group(3) or 0)
                     context["reset_at"] = time.time() + (hours * 3600) + (minutes * 60) + seconds
+                    context["reset_source"] = "message"
                 else:
                     sec_match = re.search(
                         r"retry\s+(?:after\s+)?(\d+(?:\.\d+)?)\s*(?:sec|secs|seconds|s\b)",
@@ -2524,6 +2530,7 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
                     )
                     if sec_match:
                         context["reset_at"] = time.time() + float(sec_match.group(1))
+                        context["reset_source"] = "message"
 
     return context
 

@@ -108,11 +108,13 @@ SUPPORTED_POOL_STRATEGIES = {
 
 # Cooldown before retrying an exhausted credential.
 # Transient 401 auth failures cool down briefly so single-key setups can recover.
-# 429 (rate-limited), 402 (billing/quota), and other failures cool down after 1 hour.
-# Provider-supplied reset_at timestamps override these defaults.
+# 429 usage-cap failures cool down after 1 hour when no provider reset is known.
+# Transient 429s are capped separately below so a bad/reset-like header cannot
+# freeze the primary behind a multi-hour or multi-day cooldown.
 EXHAUSTED_TTL_401_SECONDS = 5 * 60           # 5 minutes
 EXHAUSTED_TTL_429_SECONDS = 60 * 60          # 1 hour
 EXHAUSTED_TTL_DEFAULT_SECONDS = 60 * 60      # 1 hour
+TRANSIENT_429_COOLDOWN_SECONDS = 5 * 60      # 5 minutes
 
 # Pool key prefix for custom OpenAI-compatible endpoints.
 # Custom endpoints all share provider='custom' but are keyed by their
@@ -325,6 +327,9 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
         or error_context.get("resets_at")
         or error_context.get("retry_until")
     )
+    reset_source = error_context.get("reset_source")
+    if isinstance(reset_source, str) and reset_source.strip():
+        normalized["reset_source"] = reset_source.strip()
     parsed_reset_at = _parse_absolute_timestamp(reset_at)
     if parsed_reset_at is None and isinstance(message, str):
         retry_delay_seconds = _extract_retry_delay_seconds(message)
@@ -333,6 +338,52 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     if parsed_reset_at is not None:
         normalized["reset_at"] = parsed_reset_at
     return normalized
+
+
+def _looks_like_usage_cap_429(normalized_error: Dict[str, Any]) -> bool:
+    """True for 429 bodies that represent account/usage caps, not rate buckets."""
+    reset_source = str(normalized_error.get("reset_source") or "").strip().lower()
+    if reset_source in {"retry_after", "rate_limit_header"}:
+        return False
+    reason = str(normalized_error.get("reason") or "").strip().lower()
+    message = str(normalized_error.get("message") or "").strip().lower()
+    haystack = f"{reason} {message}"
+    return any(
+        token in haystack
+        for token in (
+            "usage_limit_reached",
+            "usage limit reached",
+            "usage limit has been reached",
+            "gousagelimit",
+            "device_code_exhausted",
+            "out_of_extra_usage",
+            "quota_exhausted",
+            "quota exhausted",
+            "weekly usage",
+            "monthly usage",
+            "credits exhausted",
+        )
+    )
+
+
+def _cap_transient_429_reset_at(
+    status_code: Optional[int],
+    normalized_error: Dict[str, Any],
+) -> Dict[str, Any]:
+    if status_code != 429 or _looks_like_usage_cap_429(normalized_error):
+        return normalized_error
+
+    now = time.time()
+    cap = now + TRANSIENT_429_COOLDOWN_SECONDS
+    reset_at = normalized_error.get("reset_at")
+    capped = dict(normalized_error)
+    if isinstance(reset_at, (int, float)):
+        capped["reset_at"] = min(float(reset_at), cap)
+    else:
+        capped["reset_at"] = cap
+    if not capped.get("reason"):
+        capped["reason"] = "rate_limit_transient"
+    return capped
 
 
 def _exhausted_until(entry: PooledCredential) -> Optional[float]:
@@ -572,7 +623,10 @@ class CredentialPool:
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
     ) -> PooledCredential:
-        normalized_error = _normalize_error_context(error_context)
+        normalized_error = _cap_transient_429_reset_at(
+            status_code,
+            _normalize_error_context(error_context),
+        )
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters

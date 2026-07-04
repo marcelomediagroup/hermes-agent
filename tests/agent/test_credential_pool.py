@@ -562,6 +562,143 @@ def test_429_rate_limit_still_uses_exhausted_not_dead(tmp_path, monkeypatch):
     assert persisted["last_error_code"] == 429
 
 
+def test_transient_429_caps_provider_reset_window(tmp_path, monkeypatch):
+    """A transient 429 must not freeze a credential behind a long reset."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    from agent import credential_pool as pool_mod
+    from agent.credential_pool import (
+        STATUS_EXHAUSTED,
+        TRANSIENT_429_COOLDOWN_SECONDS,
+        load_pool,
+    )
+
+    clock = {"now": 1_800_000_000.0}
+    monkeypatch.setattr(pool_mod.time, "time", lambda: clock["now"])
+    long_reset = clock["now"] + (3 * 24 * 60 * 60)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "primary",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "at-1",
+                        "refresh_token": "rt-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "at-2",
+                        "refresh_token": "rt-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    pool = load_pool("openai-codex")
+    assert pool.select().id == "cred-1"
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={
+            "reason": "usage_limit_reached",
+            "message": "You hit your usage limit.",
+            "reset_at": long_reset,
+            "reset_source": "retry_after",
+        },
+    )
+
+    assert next_entry is not None
+    assert next_entry.id == "cred-2"
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == STATUS_EXHAUSTED
+    assert persisted["last_error_code"] == 429
+    assert persisted["last_error_reason"] == "usage_limit_reached"
+    assert persisted["last_error_reset_at"] == pytest.approx(
+        clock["now"] + TRANSIENT_429_COOLDOWN_SECONDS
+    )
+
+    clock["now"] += TRANSIENT_429_COOLDOWN_SECONDS + 1
+    reloaded = load_pool("openai-codex")
+    selected = reloaded.select()
+    assert selected is not None
+    assert selected.id == "cred-1"
+    assert selected.last_status == "ok"
+    assert selected.last_error_reset_at is None
+
+
+def test_usage_cap_429_preserves_provider_reset_window(tmp_path, monkeypatch):
+    """A genuine usage-cap 429 should keep its provider reset window."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setattr("hermes_cli.auth._import_codex_cli_tokens", lambda: None)
+
+    from agent import credential_pool as pool_mod
+    from agent.credential_pool import STATUS_EXHAUSTED, load_pool
+
+    fixed_now = 1_800_000_000.0
+    monkeypatch.setattr(pool_mod.time, "time", lambda: fixed_now)
+    long_reset = fixed_now + (3 * 24 * 60 * 60)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "cred-1",
+                        "label": "weekly-cap",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "source": "manual:device_code",
+                        "access_token": "at-1",
+                        "refresh_token": "rt-1",
+                    },
+                    {
+                        "id": "cred-2",
+                        "label": "secondary",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "source": "manual:device_code",
+                        "access_token": "at-2",
+                        "refresh_token": "rt-2",
+                    },
+                ]
+            },
+        },
+    )
+
+    pool = load_pool("openai-codex")
+    assert pool.select().id == "cred-1"
+    next_entry = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={
+            "reason": "usage_limit_reached",
+            "message": "The usage limit has been reached.",
+            "reset_at": long_reset,
+        },
+    )
+
+    assert next_entry is not None
+    assert next_entry.id == "cred-2"
+    auth_payload = json.loads((tmp_path / "hermes" / "auth.json").read_text())
+    persisted = auth_payload["credential_pool"]["openai-codex"][0]
+    assert persisted["last_status"] == STATUS_EXHAUSTED
+    assert persisted["last_error_code"] == 429
+    assert persisted["last_error_reason"] == "usage_limit_reached"
+    assert persisted["last_error_reset_at"] == pytest.approx(long_reset)
+
+
 def test_generic_401_without_terminal_reason_still_uses_exhausted(tmp_path, monkeypatch):
     """A 401 with no specific code/reason should keep TTL semantics.
 
