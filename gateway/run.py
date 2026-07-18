@@ -7033,6 +7033,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             model = runtime_model
 
+        # MMG profiles predate the upstream ``channel_overrides`` contract and
+        # still carry ``<platform>.channel_model_overrides``. Preserve that
+        # bounded compatibility layer until the profile can be migrated
+        # without losing per-channel reasoning and token settings.
+        if source is not None and not override:
+            legacy_cfg = (
+                user_config
+                if isinstance(user_config, dict)
+                else _load_gateway_runtime_config()
+            )
+            model, runtime_kwargs = self._apply_channel_model_override(
+                legacy_cfg,
+                source,
+                model,
+                runtime_kwargs,
+            )
+
         cfg = getattr(self, "config", None)
         if cfg and source is not None:
             chat_id = str(source.chat_id) if source.chat_id else ""
@@ -8291,6 +8308,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _r_state = self._peek_session_state(resolved_session_key)
             if _r_state is not None and _r_state.conversation.reasoning_override is not None:
                 return _r_state.conversation.reasoning_override
+        legacy_channel_reasoning = self._resolve_channel_reasoning_config(
+            _load_gateway_runtime_config(),
+            source,
+        )
+        if legacy_channel_reasoning is not None:
+            return legacy_channel_reasoning
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -23117,6 +23140,167 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _rst_state is not None:
                 _rst_state.conversation.model_override = None
         self._evict_cached_agent(session_key)
+
+    def _channel_scoped_config_entry(
+        self,
+        user_config: dict,
+        source: Optional[SessionSource],
+        key: str,
+    ) -> Any:
+        """Return a legacy platform channel-scoped config entry."""
+        if not isinstance(user_config, dict) or source is None:
+            return None
+        platform = getattr(source, "platform", None)
+        if not platform:
+            return None
+        try:
+            platform_key = _platform_config_key(platform)
+        except Exception:
+            platform_key = getattr(platform, "value", str(platform))
+        platform_cfg = user_config.get(platform_key) or {}
+        if not isinstance(platform_cfg, dict):
+            return None
+        mapping = platform_cfg.get(key) or {}
+        if not isinstance(mapping, dict):
+            return None
+
+        ids_to_check: list[str] = []
+        for raw_id in (
+            getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+            getattr(source, "parent_chat_id", None),
+        ):
+            channel_id = str(raw_id or "").strip()
+            if channel_id and channel_id not in ids_to_check:
+                ids_to_check.append(channel_id)
+        for channel_id in ids_to_check:
+            if channel_id in mapping:
+                return mapping[channel_id]
+        return None
+
+    def _apply_channel_model_override(
+        self,
+        user_config: dict,
+        source: Optional[SessionSource],
+        model: str,
+        runtime_kwargs: dict,
+    ) -> tuple[str, dict]:
+        """Apply the legacy MMG per-channel model/provider default."""
+        entry = self._channel_scoped_config_entry(
+            user_config,
+            source,
+            "channel_model_overrides",
+        )
+        if entry is None:
+            entry = self._channel_scoped_config_entry(
+                user_config,
+                source,
+                "channel_models",
+            )
+        if entry is None:
+            return model, runtime_kwargs
+
+        if isinstance(entry, str):
+            new_model = entry.strip()
+            return (new_model or model), runtime_kwargs
+        if not isinstance(entry, dict):
+            return model, runtime_kwargs
+
+        new_model = str(entry.get("model") or entry.get("default") or "").strip()
+        new_provider = str(entry.get("provider") or "").strip()
+        explicit_base_url = str(entry.get("base_url") or "").strip() or None
+        explicit_api_key = entry.get("api_key") or None
+        key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
+        if not explicit_api_key and key_env:
+            explicit_api_key = os.getenv(key_env, "").strip() or None
+
+        updated_runtime = dict(runtime_kwargs or {})
+        if new_provider:
+            try:
+                from hermes_cli.model_normalize import normalize_model_for_provider
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                runtime = resolve_runtime_provider(
+                    requested=new_provider,
+                    explicit_base_url=explicit_base_url,
+                    explicit_api_key=explicit_api_key,
+                    target_model=new_model or None,
+                )
+                for key in (
+                    "api_key",
+                    "base_url",
+                    "provider",
+                    "api_mode",
+                    "command",
+                    "args",
+                    "credential_pool",
+                ):
+                    value = runtime.get(key)
+                    if value is not None:
+                        updated_runtime[key] = list(value) if key == "args" else value
+                resolved_provider = str(updated_runtime.get("provider") or new_provider)
+                if new_model:
+                    new_model = normalize_model_for_provider(
+                        new_model,
+                        resolved_provider,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Channel model override for chat %s failed; using session/default model: %s",
+                    getattr(source, "chat_id", "unknown") if source is not None else "unknown",
+                    exc,
+                )
+                return model, runtime_kwargs
+
+        if new_model:
+            model = new_model
+        if "max_tokens" in entry:
+            try:
+                updated_runtime["max_tokens"] = int(entry["max_tokens"])
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid channel model max_tokens for chat %s: %r",
+                    getattr(source, "chat_id", "unknown") if source is not None else "unknown",
+                    entry.get("max_tokens"),
+                )
+        return model, updated_runtime
+
+    def _resolve_channel_reasoning_config(
+        self,
+        user_config: dict,
+        source: Optional[SessionSource],
+    ) -> dict | None:
+        """Return the legacy MMG per-channel reasoning default, if set."""
+        entry = self._channel_scoped_config_entry(
+            user_config,
+            source,
+            "channel_reasoning_overrides",
+        )
+        if entry is None:
+            entry = self._channel_scoped_config_entry(
+                user_config,
+                source,
+                "channel_model_overrides",
+            )
+        effort = ""
+        if isinstance(entry, str):
+            effort = entry
+        elif isinstance(entry, dict):
+            effort = str(entry.get("reasoning_effort") or entry.get("reasoning") or "")
+        effort = effort.strip()
+        if not effort:
+            return None
+
+        from hermes_constants import parse_reasoning_effort
+
+        parsed = parse_reasoning_effort(effort)
+        if parsed is None:
+            logger.warning(
+                "Unknown channel reasoning_effort '%s' for chat %s; using session/default reasoning",
+                effort,
+                getattr(source, "chat_id", "unknown") if source is not None else "unknown",
+            )
+        return parsed
 
     def _is_intentional_model_switch(self, session_key: str, agent_model: str) -> bool:
         """Return True if *agent_model* matches an active /model session override."""

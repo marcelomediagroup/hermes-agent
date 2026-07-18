@@ -629,6 +629,81 @@ GATEWAY_SECRET_CAPTURE_UNSUPPORTED_MESSAGE = (
     "Load this skill in the local CLI to be prompted, or add the key to ~/.hermes/.env manually."
 )
 
+VOICE_TTS_REPLY_DEFAULT_MAX_CHARS = 700
+VOICE_TTS_REPLY_MIN_MAX_CHARS = 160
+VOICE_TTS_REPLY_TRUNCATION_SUFFIX = "Full details are in text."
+
+
+def _voice_tts_reply_max_chars() -> int:
+    """Resolve the spoken-reply character cap for auto-TTS/voice mode."""
+    raw: Any = VOICE_TTS_REPLY_DEFAULT_MAX_CHARS
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        raw = cfg_get(
+            load_config(),
+            "voice",
+            "tts_reply_max_chars",
+            default=VOICE_TTS_REPLY_DEFAULT_MAX_CHARS,
+        )
+    except Exception:
+        raw = VOICE_TTS_REPLY_DEFAULT_MAX_CHARS
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = VOICE_TTS_REPLY_DEFAULT_MAX_CHARS
+    return max(VOICE_TTS_REPLY_MIN_MAX_CHARS, value)
+
+
+def prepare_voice_reply_tts_text(text: str, max_chars: Optional[int] = None) -> str:
+    """Return a concise spoken version containing only user-visible prose."""
+    cleaned = str(text or "")
+
+    try:
+        from agent.agent_runtime_helpers import strip_think_blocks
+
+        cleaned = strip_think_blocks(None, cleaned)
+    except Exception:
+        pass
+
+    try:
+        from tools.tts_tool import _strip_markdown_for_tts
+
+        cleaned = _strip_markdown_for_tts(cleaned)
+    except Exception:
+        cleaned = re.sub(r"```[\s\S]*?```", " ", cleaned)
+        cleaned = re.sub(r'[*_`#\[\]()]', '', cleaned)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if not cleaned:
+        return ""
+
+    limit = max_chars if max_chars is not None else _voice_tts_reply_max_chars()
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = VOICE_TTS_REPLY_DEFAULT_MAX_CHARS
+    limit = max(VOICE_TTS_REPLY_MIN_MAX_CHARS, limit)
+
+    if len(cleaned) <= limit:
+        return cleaned
+
+    suffix = " " + VOICE_TTS_REPLY_TRUNCATION_SUFFIX
+    budget = max(60, limit - len(suffix))
+    prefix = cleaned[:budget].rstrip()
+    sentence_cut = max(prefix.rfind(". "), prefix.rfind("! "), prefix.rfind("? "))
+    if sentence_cut >= max(80, int(budget * 0.45)):
+        prefix = prefix[: sentence_cut + 1].rstrip()
+    else:
+        space_cut = prefix.rfind(" ")
+        if space_cut >= max(80, int(budget * 0.60)):
+            prefix = prefix[:space_cut].rstrip()
+        prefix = prefix.rstrip(" ,;:-")
+        if prefix and prefix[-1] not in ".!?":
+            prefix += "."
+
+    return f"{prefix}{suffix}"[:limit].strip()
+
 
 def safe_url_for_log(url: str, max_len: int = 80) -> str:
     """Return a URL string safe for logs (no query/fragment/userinfo)."""
@@ -4104,15 +4179,19 @@ class BasePlatformAdapter(ABC):
         blocks, or compact symbols to the speech provider.  It should receive
         a transcript-like script: reasoning blocks removed, headings and
         bullets flattened into sentence pauses, and units like ``°C``
-        expanded to words such as ``degrees Celsius``.
+        expanded to words such as ``degrees Celsius``. The full text response
+        is still delivered separately in chat, while the spoken reply remains
+        bounded by the profile's voice reply cap.
         """
         try:
             from tools.tts_text_normalize import prepare_spoken_text
-            return prepare_spoken_text(text, max_chars=4000)
+
+            normalized = prepare_spoken_text(text, max_chars=4000)
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
-            text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+            normalized = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
+            normalized = re.sub(r'[*_`#\[\]()]', '', normalized)[:4000].strip()
+        return prepare_voice_reply_tts_text(normalized)
 
     async def play_tts(
         self,
