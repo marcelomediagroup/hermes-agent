@@ -205,14 +205,21 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
 
 
 def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+    """Count commits behind upstream main in a local checkout.
+
+    Official git installs often point ``origin`` at the canonical SSH remote.
+    Passive update checks must not trigger SSH auth prompts, but they should
+    still report an honest commit count for full clones.  For those installs we
+    fetch the canonical HTTPS upstream into ``FETCH_HEAD`` and count against the
+    ephemeral fetched tip instead of the stale local ``origin/main`` tracking
+    ref.  Shallow clones still return presence-only because they cannot count
+    across the depth boundary safely.
+    """
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
-        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
-        checked = _check_via_rev(head_rev) if head_rev else None
-        if checked == UPDATE_AVAILABLE_NO_COUNT:
-            return 1
-        return checked
+    official_ssh_origin = _is_official_ssh_remote(origin_url)
+    fetch_remote = _UPSTREAM_REPO_URL if official_ssh_origin else "origin"
+    fetch_ref = "refs/heads/main" if official_ssh_origin else None
+    count_target = "FETCH_HEAD" if official_ssh_origin else "origin/main"
 
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
@@ -234,7 +241,11 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        fetch_args = ["git", "fetch", fetch_remote]
+        if fetch_ref:
+            fetch_args.append(fetch_ref)
+        elif fetch_remote == "origin":
+            fetch_args.append("main")
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -247,21 +258,24 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         pass  # Offline or timeout — use stale refs, that's fine
 
     if is_shallow:
-        # No history to count across the shallow boundary. `origin/main` may not
-        # be a tracking ref in a `clone --depth 1`, so prefer FETCH_HEAD (just
-        # updated by the fetch above) and fall back to origin/main.
+        # No history to count across the shallow boundary. Prefer the freshly
+        # fetched tip; for non-SSH installers `origin/main` remains the fallback.
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", count_target], cwd=repo_dir)
             or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
         )
+        if official_ssh_origin and not target_rev:
+            checked = _check_via_rev(head_rev) if head_rev else None
+            return checked
         if not head_rev or not target_rev:
             return None
         return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{count_target}"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),
@@ -270,6 +284,11 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return int(result.stdout.strip())
     except Exception:
         pass
+
+    if official_ssh_origin:
+        head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+        return _check_via_rev(head_rev) if head_rev else None
+
     return None
 
 
