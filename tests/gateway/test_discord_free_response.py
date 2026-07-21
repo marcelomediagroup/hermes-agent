@@ -109,6 +109,7 @@ def adapter(monkeypatch):
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
         "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
@@ -305,6 +306,71 @@ async def test_discord_free_response_channel_skips_auto_thread(adapter, monkeypa
     event = adapter.handle_message.await_args.args[0]
     assert event.text == "casual chat in free-response channel"
     assert event.source.chat_type == "group"
+
+
+def test_discord_threaded_free_response_channels_bare_int(adapter, monkeypatch):
+    monkeypatch.delenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", raising=False)
+    adapter.config.extra["threaded_free_response_channels"] = 1491973769726791812
+
+    assert adapter._discord_threaded_free_response_channels() == {
+        "1491973769726791812"
+    }
+
+
+@pytest.mark.asyncio
+async def test_discord_threaded_free_response_channel_auto_threads(
+    adapter, monkeypatch
+):
+    """Threaded free-response channels stay mention-free and still thread."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.setenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", "789")
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+
+    fake_thread = FakeThread(channel_id=999, name="threaded-free-response")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="open a new task without mention",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "999"
+
+
+@pytest.mark.asyncio
+async def test_discord_threaded_free_response_channel_from_config_extra(
+    adapter, monkeypatch
+):
+    """Config-extra threaded free-response channels work without env vars."""
+    monkeypatch.delenv("DISCORD_REQUIRE_MENTION", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_AUTO_THREAD", raising=False)
+    adapter.config.extra["require_mention"] = True
+    adapter.config.extra["threaded_free_response_channels"] = ["789"]
+
+    fake_thread = FakeThread(channel_id=1001, name="threaded-extra")
+    adapter._auto_create_thread = AsyncMock(return_value=fake_thread)
+
+    message = make_message(
+        channel=FakeTextChannel(channel_id=789),
+        content="config-driven thread creation",
+    )
+
+    await adapter._handle_message(message)
+
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_type == "thread"
+    assert event.source.thread_id == "1001"
 
 
 @pytest.mark.asyncio
@@ -825,5 +891,4 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     assert event.channel_context == (
         "[Context around the replied-to message]\n[Hermes [bot]] earlier answer"
     )
-
 
