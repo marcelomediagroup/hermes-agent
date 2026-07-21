@@ -1540,7 +1540,10 @@ class DiscordAdapter(BasePlatformAdapter):
                 parent_id = None
                 if hasattr(message.channel, "parent_id") and message.channel.parent_id:
                     parent_id = str(message.channel.parent_id)
-                free_channels = self._discord_free_response_channels()
+                free_channels = (
+                    self._discord_free_response_channels()
+                    | self._discord_threaded_free_response_channels()
+                )
                 channel_keys = self._discord_channel_keys(message, parent_id)
                 if "*" not in free_channels and not (channel_keys & free_channels):
                     return False, False
@@ -6398,6 +6401,18 @@ class DiscordAdapter(BasePlatformAdapter):
             return {part.strip() for part in s.split(",") if part.strip()}
         return set()
 
+    def _discord_threaded_free_response_channels(self) -> set:
+        """Return mention-free channels that should still auto-thread."""
+        raw = self.config.extra.get("threaded_free_response_channels")
+        if raw is None:
+            raw = os.getenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        value = str(raw).strip() if raw is not None else ""
+        if value:
+            return {part.strip() for part in value.split(",") if part.strip()}
+        return set()
+
     def _raw_mentioned_user_ids(self, message: Any) -> set:
         """Extract Discord user-mention IDs directly from raw message content.
 
@@ -7805,6 +7820,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return False
 
             free_channels = self._discord_free_response_channels()
+            threaded_free_channels = self._discord_threaded_free_response_channels()
 
             require_mention = self._discord_require_mention()
             # Voice-linked text channels act as free-response while voice is active.
@@ -7812,9 +7828,14 @@ class DiscordAdapter(BasePlatformAdapter):
             voice_linked_ids = {str(ch_id) for ch_id in self._voice_text_channels.values()}
             current_channel_id = str(message.channel.id)
             is_voice_linked_channel = current_channel_id in voice_linked_ids
+            is_threaded_free_channel = (
+                "*" in threaded_free_channels
+                or bool(channel_keys & threaded_free_channels)
+            )
             is_free_channel = (
                 "*" in free_channels
                 or bool(channel_keys & free_channels)
+                or is_threaded_free_channel
                 or is_voice_linked_channel
             )
 
@@ -7839,7 +7860,11 @@ class DiscordAdapter(BasePlatformAdapter):
         auto_threaded_channel = None
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = (
+                bool(channel_keys & no_thread_channels)
+                or is_voice_linked_channel
+                or (is_free_channel and not is_threaded_free_channel)
+            )
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
@@ -10070,6 +10095,16 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
         seeded_extra["free_response_channels"] = str(frc)
         if not _skip_env_bridge and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
+    tfrc = discord_cfg.get("threaded_free_response_channels")
+    if tfrc is not None:
+        if isinstance(tfrc, list):
+            tfrc = ",".join(str(v) for v in tfrc)
+        seeded_extra["threaded_free_response_channels"] = str(tfrc)
+        if (
+            not _skip_env_bridge
+            and not os.getenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS")
+        ):
+            os.environ["DISCORD_THREADED_FREE_RESPONSE_CHANNELS"] = str(tfrc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
