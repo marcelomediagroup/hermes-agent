@@ -580,10 +580,19 @@ class VoiceReceiver:
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
-    def __init__(self, voice_client, allowed_user_ids: set = None):
+    def __init__(
+        self,
+        voice_client,
+        allowed_user_ids: set = None,
+        *,
+        silence_threshold_seconds: float = SILENCE_THRESHOLD,
+        min_speech_seconds: float = MIN_SPEECH_DURATION,
+    ):
         self._vc = voice_client
         self._allowed_user_ids = allowed_user_ids or set()
         self._running = False
+        self._silence_threshold_seconds = float(silence_threshold_seconds)
+        self._min_speech_seconds = float(min_speech_seconds)
 
         # Decryption
         self._secret_key: Optional[bytes] = None
@@ -874,7 +883,10 @@ class VoiceReceiver:
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
-                if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                if (
+                    silence_duration >= self._silence_threshold_seconds
+                    and buf_duration >= self._min_speech_seconds
+                ):
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
@@ -884,7 +896,7 @@ class VoiceReceiver:
                         completed.append((user_id, bytes(buf)))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
-                elif silence_duration >= self.SILENCE_THRESHOLD * 2:
+                elif silence_duration >= self._silence_threshold_seconds * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
@@ -1091,6 +1103,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
+        self._voice_input_cfg: Dict[str, float] = self._load_voice_input_config()
         self._voice_input_callback: Optional[Callable] = None  # set by run.py
         self._on_voice_disconnect: Optional[Callable] = None  # set by run.py
         # Resolves the current voice-reply mode ("off"|"voice_only"|"all") for a
@@ -1103,6 +1116,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
+        self._ack_pcm_cache: Dict[str, bytes] = {}  # phrase -> decoded PCM
+        self._ack_pcm_locks: Dict[str, asyncio.Lock] = {}  # phrase -> synthesis gate
+        self._ack_prewarm_task: Optional[asyncio.Task] = None
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
@@ -1832,6 +1848,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # Cancel the liveness probe first so it can't fire a spurious fatal
         # error / reconnect while we're intentionally tearing the adapter down.
         await self._cancel_liveness_task()
+        prewarm_task = getattr(self, "_ack_prewarm_task", None)
+        if prewarm_task is not None and not prewarm_task.done():
+            prewarm_task.cancel()
+            try:
+                await prewarm_task
+            except asyncio.CancelledError:
+                pass
+        self._ack_prewarm_task = None
+
         # Clean up all active voice connections *before* cancelling the bot task.
         # leave_voice_channel() ends in `await vc.disconnect()`, and discord.py's
         # VoiceClient.disconnect() sends a voice state update over the main
@@ -3971,6 +3996,37 @@ class DiscordAdapter(BasePlatformAdapter):
     # Voice channel methods (join / leave / play)
     # ------------------------------------------------------------------
 
+    def _load_voice_input_config(self) -> Dict[str, float]:
+        """Read Discord voice-input timing settings from config.yaml."""
+        resolved = {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        }
+        ranges = {
+            "silence_threshold_seconds": (0.5, 5.0),
+            "min_speech_seconds": (0.1, 10.0),
+        }
+        try:
+            from hermes_cli.config import load_config
+
+            # Use the effective configuration so managed-profile overlays retain
+            # their documented precedence over user YAML.
+            cfg = load_config() or {}
+            voice_input = ((cfg.get("discord") or {}).get("voice_input") or {})
+            for key in resolved:
+                if key in voice_input:
+                    raw_value = voice_input[key]
+                    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)):
+                        continue
+                    value = float(raw_value)
+                    if not math.isfinite(value):
+                        continue
+                    lower, upper = ranges[key]
+                    resolved[key] = min(upper, max(lower, value))
+        except Exception as e:
+            logger.debug("Could not load discord.voice_input config: %s", e)
+        return resolved
+
     def _load_voice_fx_config(self) -> Dict[str, Any]:
         """Read voice mixer / ambient / ack settings from config.yaml.
 
@@ -4142,6 +4198,7 @@ class DiscordAdapter(BasePlatformAdapter):
             vc.stop()
         vc.play(mixer, after=_after)
         self._voice_mixers[guild_id] = mixer
+        self._schedule_ack_prewarm()
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
 
     def _lead_silence_bytes(self) -> bytes:
@@ -4165,6 +4222,100 @@ class DiscordAdapter(BasePlatformAdapter):
             from .voice_mixer import BYTES_PER_MS
         return b"\x00" * (BYTES_PER_MS * lead_ms)
 
+    def _schedule_ack_prewarm(self) -> None:
+        """Start one adapter-wide acknowledgement warmup in the background."""
+        current = getattr(self, "_ack_prewarm_task", None)
+        if current is not None and not current.done():
+            return
+
+        task = asyncio.create_task(self._prewarm_ack_pcm())
+        self._ack_prewarm_task = task
+
+        def _clear(done: asyncio.Task) -> None:
+            if getattr(self, "_ack_prewarm_task", None) is done:
+                self._ack_prewarm_task = None
+
+        task.add_done_callback(_clear)
+
+    async def _get_ack_pcm(self, phrase: str) -> Optional[bytes]:
+        """Return cached acknowledgement PCM, synthesising it once if needed."""
+        cache = getattr(self, "_ack_pcm_cache", None)
+        if cache is None:
+            cache = self._ack_pcm_cache = {}
+        if phrase in cache:
+            return cache[phrase]
+
+        locks = getattr(self, "_ack_pcm_locks", None)
+        if locks is None:
+            locks = self._ack_pcm_locks = {}
+        lock = locks.setdefault(phrase, asyncio.Lock())
+        async with lock:
+            if phrase in cache:
+                return cache[phrase]
+
+            import uuid as _uuid
+            audio_path = os.path.join(
+                tempfile.gettempdir(), "hermes_voice",
+                f"ack_{_uuid.uuid4().hex[:12]}.mp3",
+            )
+            os.makedirs(os.path.dirname(audio_path), exist_ok=True)
+
+            def _synthesize_and_decode_ack() -> Optional[bytes]:
+                """Run blocking synthesis, decode, and cleanup as one worker unit."""
+                actual_path = None
+                try:
+                    from tools.tts_tool import text_to_speech_tool
+                    result_json = text_to_speech_tool(
+                        text=phrase, output_path=audio_path
+                    )
+                    result = json.loads(result_json)
+                    provider_path = result.get("file_path", audio_path)
+                    if not isinstance(provider_path, (str, os.PathLike)):
+                        return None
+                    actual_path = os.fspath(provider_path)
+                    if not isinstance(actual_path, str):
+                        return None
+                    if not result.get("success") or not os.path.isfile(actual_path):
+                        return None
+                    try:
+                        from voice_mixer import decode_to_pcm
+                    except ImportError:
+                        from .voice_mixer import decode_to_pcm
+                    return decode_to_pcm(actual_path) or None
+                finally:
+                    for candidate in (audio_path, actual_path):
+                        if not isinstance(candidate, (str, os.PathLike)):
+                            continue
+                        path = os.fspath(candidate)
+                        if not isinstance(path, str):
+                            continue
+                        if path and os.path.isfile(path):
+                            try:
+                                os.unlink(path)
+                            except OSError:
+                                pass
+
+            pcm = await asyncio.to_thread(_synthesize_and_decode_ack)
+            if not pcm:
+                return None
+            cache[phrase] = pcm
+            return pcm
+
+    async def _prewarm_ack_pcm(self) -> None:
+        """Best-effort warmup for every selectable acknowledgement."""
+        if not self._voice_fx_cfg.get("ack_enabled"):
+            return
+        phrases = self._voice_fx_cfg.get("ack_phrases") or []
+        if not isinstance(phrases, (list, tuple)) or not phrases:
+            return
+        for phrase in phrases:
+            if not isinstance(phrase, str) or not phrase:
+                continue
+            try:
+                await self._get_ack_pcm(phrase)
+            except Exception as e:
+                logger.debug("Ack PCM prewarm failed for %r: %s", phrase, e)
+
     async def play_ack_in_voice(self, guild_id: int, phrase: Optional[str] = None) -> bool:
         """Speak a short acknowledgement over the ambient bed.
 
@@ -4182,27 +4333,8 @@ class DiscordAdapter(BasePlatformAdapter):
             phrases = self._voice_fx_cfg.get("ack_phrases") or ["One moment."]
             phrase = random.choice(phrases)
 
-        # Synthesise the ack via the configured TTS provider, then layer it.
-        import uuid as _uuid
-        audio_path = os.path.join(
-            tempfile.gettempdir(), "hermes_voice",
-            f"ack_{_uuid.uuid4().hex[:12]}.mp3",
-        )
-        os.makedirs(os.path.dirname(audio_path), exist_ok=True)
         try:
-            from tools.tts_tool import text_to_speech_tool
-            result_json = await asyncio.to_thread(
-                text_to_speech_tool, text=phrase, output_path=audio_path
-            )
-            result = json.loads(result_json)
-            actual = result.get("file_path", audio_path)
-            if not result.get("success") or not os.path.isfile(actual):
-                return False
-            try:
-                from voice_mixer import decode_to_pcm
-            except ImportError:
-                from .voice_mixer import decode_to_pcm
-            pcm = await asyncio.to_thread(decode_to_pcm, actual)
+            pcm = await self._get_ack_pcm(phrase)
             if not pcm:
                 return False
             mixer.play_speech(
@@ -4214,13 +4346,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.debug("play_ack_in_voice failed: %s", e)
             return False
-        finally:
-            for p in {audio_path, locals().get("actual")}:
-                if p and os.path.isfile(p):
-                    try:
-                        os.unlink(p)
-                    except OSError:
-                        pass
 
     def voice_mixer_active(self, guild_id: int) -> bool:
         """True when a continuous mixer is installed for this guild."""
@@ -4264,7 +4389,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             # Start voice receiver (Phase 2: listen to users)
             try:
-                receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                receiver = VoiceReceiver(
+                    vc,
+                    allowed_user_ids=self._allowed_user_ids,
+                    silence_threshold_seconds=self._voice_input_cfg[
+                        "silence_threshold_seconds"
+                    ],
+                    min_speech_seconds=self._voice_input_cfg["min_speech_seconds"],
+                )
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(

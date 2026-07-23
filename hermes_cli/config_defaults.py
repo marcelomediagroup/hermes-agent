@@ -2005,6 +2005,12 @@ DEFAULT_CONFIG = {
         # override: DISCORD_APPROVAL_MENTIONS. Default false avoids surprise
         # pings.
         "approval_mentions": False,
+        # Voice-input turn-detection timings. The adapter validates finite
+        # numeric values and clamps custom settings to safe ranges.
+        "voice_input": {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        },
         # Discord voice-channel inactivity timeout, in seconds. Set to 0 to
         # keep the bot in VC until an explicit `/voice leave` / disconnect.
         "voice_channel_inactivity_timeout_seconds": 300,

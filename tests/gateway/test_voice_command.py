@@ -426,7 +426,7 @@ class TestVoiceInHelp:
 class TestVoiceReceiver:
     """Test VoiceReceiver silence detection, SSRC mapping, and lifecycle."""
 
-    def _make_receiver(self):
+    def _make_receiver(self, **kwargs):
         from plugins.platforms.discord.adapter import VoiceReceiver
         mock_vc = MagicMock()
         mock_vc._connection.secret_key = [0] * 32
@@ -435,7 +435,7 @@ class TestVoiceReceiver:
         mock_vc._connection.add_socket_listener = MagicMock()
         mock_vc._connection.remove_socket_listener = MagicMock()
         mock_vc._connection.hook = None
-        receiver = VoiceReceiver(mock_vc)
+        receiver = VoiceReceiver(mock_vc, **kwargs)
         return receiver
 
     def test_initial_state(self):
@@ -509,6 +509,25 @@ class TestVoiceReceiver:
 
         assert ffmpeg_utils.resolve_ffmpeg_executable() == str(ffmpeg)
 
+    def test_custom_timing_thresholds_control_utterance_completion(self):
+        receiver = self._make_receiver(
+            silence_threshold_seconds=0.6,
+            min_speech_seconds=0.1,
+        )
+        receiver.map_ssrc(100, 42)
+        receiver._buffers[100] = bytearray(b"\x00" * 38400)
+        receiver._last_packet_time[100] = time.monotonic() - 0.7
+
+        completed = receiver.check_silence()
+
+        assert completed == [(42, b"\x00" * 38400)]
+
+    def test_on_packet_skips_when_not_running(self):
+        receiver = self._make_receiver()
+        # Not started — _running is False
+        receiver._on_packet(b"\x00" * 100)
+        assert len(receiver._buffers) == 0
+
 
     def test_on_packet_skips_non_rtp(self):
         receiver = self._make_receiver()
@@ -518,6 +537,223 @@ class TestVoiceReceiver:
         data[0] = 0x00  # version 0, not 2
         receiver._on_packet(bytes(data))
         assert len(receiver._buffers) == 0
+
+
+class TestVoiceInputConfig:
+    def test_defaults_and_dashboard_schema_expose_timing_keys(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        assert DEFAULT_CONFIG["discord"]["voice_input"] == {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        }
+
+        pytest.importorskip("fastapi")
+        from hermes_cli.web_server import CONFIG_SCHEMA
+
+        assert "discord.voice_input.silence_threshold_seconds" in CONFIG_SCHEMA
+        assert "discord.voice_input.min_speech_seconds" in CONFIG_SCHEMA
+        assert CONFIG_SCHEMA["discord.voice_input.silence_threshold_seconds"]["type"] == "number"
+        assert CONFIG_SCHEMA["discord.voice_input.min_speech_seconds"]["type"] == "number"
+
+    def test_absent_config_uses_existing_thresholds(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        with patch("hermes_cli.config.load_config", return_value={}):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        }
+
+    def test_finite_numeric_values_are_loaded(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        raw_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": 0.8,
+                    "min_speech_seconds": 0.2,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=raw_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 0.8,
+            "min_speech_seconds": 0.2,
+        }
+
+    def test_effective_managed_config_is_honored(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        effective_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": 0.7,
+                    "min_speech_seconds": 0.15,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=effective_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 0.7,
+            "min_speech_seconds": 0.15,
+        }
+
+    def test_numeric_values_are_clamped_to_safe_ranges(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        raw_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": 0.1,
+                    "min_speech_seconds": 50,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=raw_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 0.5,
+            "min_speech_seconds": 10.0,
+        }
+
+    def test_booleans_fall_back_to_defaults(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        raw_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": True,
+                    "min_speech_seconds": False,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=raw_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        }
+
+    def test_malformed_value_does_not_discard_valid_sibling(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        raw_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": "not-a-duration",
+                    "min_speech_seconds": 0.2,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=raw_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.2,
+        }
+
+    def test_numeric_strings_fall_back_to_defaults(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        raw_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": "0.8",
+                    "min_speech_seconds": "0.2",
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=raw_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        }
+
+    @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+    def test_non_finite_values_fall_back_to_defaults(self, value):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        raw_config = {
+            "discord": {
+                "voice_input": {
+                    "silence_threshold_seconds": value,
+                    "min_speech_seconds": value,
+                }
+            }
+        }
+        with patch("hermes_cli.config.load_config", return_value=raw_config):
+            resolved = adapter._load_voice_input_config()
+
+        assert resolved == {
+            "silence_threshold_seconds": 1.5,
+            "min_speech_seconds": 0.5,
+        }
+
+    @pytest.mark.asyncio
+    async def test_join_propagates_timing_config_to_new_receiver(self):
+        from gateway.config import Platform, PlatformConfig
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = object.__new__(DiscordAdapter)
+        adapter.platform = Platform.DISCORD
+        adapter.config = PlatformConfig(enabled=True, extra={})
+        adapter._client = MagicMock()
+        adapter._voice_clients = {}
+        adapter._voice_locks = {}
+        adapter._voice_timeout_tasks = {}
+        adapter._voice_receivers = {}
+        adapter._voice_listen_tasks = {}
+        adapter._voice_mixers = {}
+        adapter._allowed_user_ids = {"42"}
+        adapter._voice_input_cfg = {
+            "silence_threshold_seconds": 0.8,
+            "min_speech_seconds": 0.2,
+        }
+        adapter._voice_fx_cfg = {"enabled": False}
+        adapter._reset_voice_timeout = MagicMock()
+
+        channel = MagicMock()
+        channel.guild.id = 111
+        voice_client = MagicMock()
+        channel.connect = AsyncMock(return_value=voice_client)
+
+        def _close_listen_loop(coro):
+            coro.close()
+            return MagicMock()
+
+        with patch("plugins.platforms.discord.adapter.DISCORD_AVAILABLE", True), \
+                patch("plugins.platforms.discord.adapter.VoiceReceiver") as receiver_cls, \
+                patch("asyncio.ensure_future", side_effect=_close_listen_loop):
+            joined = await adapter.join_voice_channel(channel)
+
+        assert joined is True
+        receiver_cls.assert_called_once_with(
+            voice_client,
+            allowed_user_ids={"42"},
+            silence_threshold_seconds=0.8,
+            min_speech_seconds=0.2,
+        )
+        receiver_cls.return_value.start.assert_called_once_with()
 
 
 # =====================================================================
