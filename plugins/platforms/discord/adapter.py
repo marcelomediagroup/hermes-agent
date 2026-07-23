@@ -1116,8 +1116,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # loop overlap in one outgoing stream instead of stop-and-swap.
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
-        self._ack_pcm_cache: Dict[str, bytes] = {}  # phrase -> decoded PCM
-        self._ack_pcm_locks: Dict[str, asyncio.Lock] = {}  # phrase -> synthesis gate
+        self._ack_pcm_cache: Dict[Tuple[str, str], bytes] = {}  # (TTS scope, phrase) -> PCM
+        self._ack_pcm_locks: Dict[Tuple[str, str], asyncio.Lock] = {}  # cache key -> gate
+        self._ack_pcm_scope: Optional[str] = None
         self._ack_prewarm_task: Optional[asyncio.Task] = None
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Track threads where the bot has participated so follow-up messages
@@ -4237,21 +4238,48 @@ class DiscordAdapter(BasePlatformAdapter):
 
         task.add_done_callback(_clear)
 
+    def _ack_tts_scope(self) -> str:
+        """Return a non-secret fingerprint of the effective TTS configuration."""
+        try:
+            from hermes_cli.config import load_config
+
+            tts_config = (load_config() or {}).get("tts") or {}
+            canonical = json.dumps(
+                tts_config,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+                default=str,
+            )
+        except Exception:
+            canonical = "{}"
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    def _ack_pcm_cache_key(self, phrase: str) -> Tuple[str, str]:
+        """Activate the current TTS scope and evict superseded PCM entries."""
+        scope = self._ack_tts_scope()
+        if getattr(self, "_ack_pcm_scope", None) != scope:
+            getattr(self, "_ack_pcm_cache", {}).clear()
+            getattr(self, "_ack_pcm_locks", {}).clear()
+            self._ack_pcm_scope = scope
+        return scope, phrase
+
     async def _get_ack_pcm(self, phrase: str) -> Optional[bytes]:
         """Return cached acknowledgement PCM, synthesising it once if needed."""
+        cache_key = self._ack_pcm_cache_key(phrase)
         cache = getattr(self, "_ack_pcm_cache", None)
         if cache is None:
             cache = self._ack_pcm_cache = {}
-        if phrase in cache:
-            return cache[phrase]
+        if cache_key in cache:
+            return cache[cache_key]
 
         locks = getattr(self, "_ack_pcm_locks", None)
         if locks is None:
             locks = self._ack_pcm_locks = {}
-        lock = locks.setdefault(phrase, asyncio.Lock())
+        lock = locks.setdefault(cache_key, asyncio.Lock())
         async with lock:
-            if phrase in cache:
-                return cache[phrase]
+            if cache_key in cache:
+                return cache[cache_key]
 
             import uuid as _uuid
             audio_path = os.path.join(
@@ -4296,9 +4324,15 @@ class DiscordAdapter(BasePlatformAdapter):
                                 pass
 
             pcm = await asyncio.to_thread(_synthesize_and_decode_ack)
-            if not pcm:
-                return None
-            cache[phrase] = pcm
+            # A config edit can land while TTS is running in the worker.  Only
+            # retain PCM when the effective scope is still the one that gated
+            # this synthesis; otherwise play it once and resynthesise next time.
+            if (
+                pcm
+                and self._ack_tts_scope() == cache_key[0]
+                and getattr(self, "_ack_pcm_scope", None) == cache_key[0]
+            ):
+                cache[cache_key] = pcm
             return pcm
 
     async def _prewarm_ack_pcm(self) -> None:
