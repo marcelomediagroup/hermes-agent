@@ -13,7 +13,7 @@ import os
 import subprocess
 import sys
 import threading
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -272,6 +272,99 @@ class TestPlayAckInVoice:
         assert synthesize.call_count == 1
         assert decode.call_count == 1
         assert mixer.play_speech.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_resynthesizes_same_phrase_when_tts_config_changes(self):
+        adapter = _make_adapter()
+        mixer = MagicMock()
+        adapter._voice_mixers[111] = mixer
+        adapter._reset_voice_timeout = MagicMock()
+
+        def synthesize(*, text, output_path):
+            del text
+            with open(output_path, "wb") as audio_file:
+                audio_file.write(b"id3")
+            return '{"success": true, "file_path": "%s"}' % output_path
+
+        active_voice = {"name": "voice-a"}
+
+        def load_config():
+            return {
+                "tts": {
+                    "provider": "edge",
+                    "edge": {"voice": active_voice["name"]},
+                }
+            }
+
+        with patch(
+            "hermes_cli.config.load_config", side_effect=load_config
+        ), patch(
+            "tools.tts_tool.text_to_speech_tool", side_effect=synthesize
+        ) as synthesis, patch.object(
+            vm,
+            "decode_to_pcm",
+            side_effect=[b"\x01" * vm.FRAME_SIZE, b"\x02" * vm.FRAME_SIZE],
+        ) as decode:
+            first = await adapter.play_ack_in_voice(111, phrase="Config-aware.")
+            active_voice["name"] = "voice-b"
+            second = await adapter.play_ack_in_voice(111, phrase="Config-aware.")
+
+        assert first is True
+        assert second is True
+        assert synthesis.call_count == 2
+        assert decode.call_count == 2
+        assert mixer.play_speech.call_args_list == [
+            call(b"\x01" * vm.FRAME_SIZE, gain=1.0),
+            call(b"\x02" * vm.FRAME_SIZE, gain=1.0),
+        ]
+        assert len(adapter._ack_pcm_cache) == 1
+        assert len(adapter._ack_pcm_locks) == 1
+
+    @pytest.mark.asyncio
+    async def test_config_change_during_synthesis_is_not_cached_under_old_scope(self):
+        adapter = _make_adapter()
+        mixer = MagicMock()
+        adapter._voice_mixers[111] = mixer
+        adapter._reset_voice_timeout = MagicMock()
+        active_voice = {"name": "voice-a"}
+        synthesis_count = 0
+
+        def load_config():
+            return {
+                "tts": {
+                    "provider": "edge",
+                    "edge": {"voice": active_voice["name"]},
+                }
+            }
+
+        def synthesize(*, text, output_path):
+            nonlocal synthesis_count
+            del text
+            synthesis_count += 1
+            if synthesis_count == 1:
+                active_voice["name"] = "voice-b"
+            with open(output_path, "wb") as audio_file:
+                audio_file.write(active_voice["name"].encode())
+            return '{"success": true, "file_path": "%s"}' % output_path
+
+        with patch(
+            "hermes_cli.config.load_config", side_effect=load_config
+        ), patch(
+            "tools.tts_tool.text_to_speech_tool", side_effect=synthesize
+        ) as synthesis, patch.object(
+            vm, "decode_to_pcm", side_effect=lambda path: open(path, "rb").read()
+        ):
+            first = await adapter.play_ack_in_voice(111, phrase="Race-safe.")
+            active_voice["name"] = "voice-a"
+            second = await adapter.play_ack_in_voice(111, phrase="Race-safe.")
+
+        assert first is True
+        assert second is True
+        assert synthesis.call_count == 2
+        assert mixer.play_speech.call_args_list == [
+            call(b"voice-b", gain=1.0),
+            call(b"voice-a", gain=1.0),
+        ]
 
     @pytest.mark.asyncio
     async def test_concurrent_prewarm_and_play_share_one_synthesis(self):
