@@ -517,38 +517,65 @@ def check_discord_requirements() -> bool:
     return True
 
 
-def _build_allowed_mentions():
-    """Build Discord ``AllowedMentions`` with safe defaults, overridable via env.
+def _setting_bool(
+    env_name: str,
+    configured: Any,
+    default: bool,
+) -> bool:
+    """Resolve a boolean with explicit env override over instance config."""
+    raw = os.getenv(env_name, "").strip().lower()
+    if raw:
+        return raw in {"true", "1", "yes", "on"}
+    if configured is None or configured == "":
+        return default
+    if isinstance(configured, bool):
+        return configured
+    return str(configured).strip().lower() in {"true", "1", "yes", "on"}
+
+
+def _build_allowed_mentions(
+    *,
+    configured: Optional[Dict[str, Any]] = None,
+    mention_user_on_final: Optional[bool] = None,
+):
+    """Build safe Discord mention policy with env-over-instance precedence.
 
     Discord bots default to parsing ``@everyone``, ``@here``, role pings, and
     user pings when ``allowed_mentions`` is unset on the client — any LLM
     output or echoed user content that contains ``@everyone`` would therefore
     ping the whole server. We explicitly deny ``@everyone`` and role pings
-    by default and keep user / replied-user pings enabled so normal
-    conversation still works.
+    by default and keep individual user pings enabled.
 
-    Override via environment variables (or ``discord.allow_mentions.*`` in
-    config.yaml):
-
-        DISCORD_ALLOW_MENTION_EVERYONE      default false  — @everyone + @here
-        DISCORD_ALLOW_MENTION_ROLES         default false  — @role pings
-        DISCORD_ALLOW_MENTION_USERS         default true   — @user pings
-        DISCORD_ALLOW_MENTION_REPLIED_USER  default true   — reply-ping author
+    Environment variables override per-adapter ``discord.allow_mentions``
+    values. Keeping YAML on the adapter instance avoids profile leakage in
+    multiplex gateways.
     """
     if not DISCORD_AVAILABLE:
         return None
 
-    def _b(name: str, default: bool) -> bool:
-        raw = os.getenv(name, "").strip().lower()
-        if not raw:
-            return default
-        return raw in {"true", "1", "yes", "on"}
+    configured = configured if isinstance(configured, dict) else {}
 
+    def _b(name: str, key: str, default: bool) -> bool:
+        return _setting_bool(name, configured.get(key), default)
+
+    # Final-only explicit mention mode must not allow Discord's implicit reply
+    # ping to notify users on streaming previews or tool/progress messages.
+    # An explicit DISCORD_ALLOW_MENTION_REPLIED_USER value still wins.
+    final_mentions = _setting_bool(
+        "DISCORD_MENTION_USER_ON_FINAL",
+        mention_user_on_final,
+        False,
+    )
+    replied_user_default = not final_mentions
     return discord.AllowedMentions(
-        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
-        roles=_b("DISCORD_ALLOW_MENTION_ROLES", False),
-        users=_b("DISCORD_ALLOW_MENTION_USERS", True),
-        replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
+        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", "everyone", False),
+        roles=_b("DISCORD_ALLOW_MENTION_ROLES", "roles", False),
+        users=_b("DISCORD_ALLOW_MENTION_USERS", "users", True),
+        replied_user=_b(
+            "DISCORD_ALLOW_MENTION_REPLIED_USER",
+            "replied_user",
+            replied_user_default,
+        ),
     )
 
 
@@ -1003,10 +1030,41 @@ _DISCORD_PROMPT_TIMEOUT_MAX = 900
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"true", "1", "yes", "on"}
+    return _setting_bool(name, None, default)
+
+
+def _final_user_mention_requested(
+    metadata: Optional[Dict[str, Any]],
+    *,
+    enabled: Optional[bool] = None,
+) -> bool:
+    """Whether this send must generate an individual requester mention."""
+    if not _setting_bool("DISCORD_MENTION_USER_ON_FINAL", enabled, False):
+        return False
+    if not metadata or metadata.get("notify") is not True:
+        return False
+    requester_user_id = str(metadata.get("requester_user_id") or "").strip()
+    return requester_user_id.isdigit()
+
+
+def _with_final_user_mention(
+    content: str,
+    metadata: Optional[Dict[str, Any]],
+    *,
+    enabled: Optional[bool] = None,
+) -> str:
+    """Prefix notify-worthy replies with the requesting Discord user mention.
+
+    Progress, tool, and interim sends omit ``notify`` and therefore remain
+    silent when a channel is configured for mention-only notifications.
+    """
+    if not _final_user_mention_requested(metadata, enabled=enabled):
+        return content
+    requester_user_id = str(metadata.get("requester_user_id") or "").strip()
+    mention = f"<@{requester_user_id}>"
+    if content.startswith(mention):
+        return content
+    return f"{mention}\n{content}" if content else mention
 
 
 def _read_discord_prompt_timeout() -> int:
@@ -1171,6 +1229,15 @@ class DiscordAdapter(BasePlatformAdapter):
         # Reply threading mode: "off" (no replies), "first" (reply on first
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        self._mention_user_on_final = _setting_bool(
+            "DISCORD_MENTION_USER_ON_FINAL",
+            self.config.extra.get("mention_user_on_final"),
+            False,
+        )
+        _allow_mentions = self.config.extra.get("allow_mentions")
+        self._allow_mentions_config: Dict[str, Any] = (
+            dict(_allow_mentions) if isinstance(_allow_mentions, dict) else {}
+        )
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
@@ -1187,6 +1254,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # Mirrors the Telegram #58563 fix. Entries are dropped on finalize.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+
+    @property
+    def mention_user_on_final_enabled(self) -> bool:
+        """Whether this adapter instance emits final requester mentions."""
+        return self._mention_user_on_final
 
     def _config_value(
         self, key: str, default: Any, *, env_key: Optional[str] = None
@@ -1391,7 +1463,10 @@ class DiscordAdapter(BasePlatformAdapter):
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
-                allowed_mentions=_build_allowed_mentions(),
+                allowed_mentions=_build_allowed_mentions(
+                    configured=self._allow_mentions_config,
+                    mention_user_on_final=self._mention_user_on_final,
+                ),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
@@ -3049,6 +3124,24 @@ class DiscordAdapter(BasePlatformAdapter):
         """Check if message reactions are enabled via config/env."""
         return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
 
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Use a fresh final message when it must generate a requester ping.
+
+        Discord does not deliver a new push notification for a mention added
+        by editing an existing streaming preview.  A fresh send is therefore
+        required for final-only mention mode.
+        """
+        if not self._mention_user_on_final:
+            return False
+        requester_user_id = str(
+            (metadata or {}).get("requester_user_id") or ""
+        ).strip()
+        return requester_user_id.isdigit()
+
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
         message = event.raw_message
@@ -3166,6 +3259,12 @@ class DiscordAdapter(BasePlatformAdapter):
                 operator_card_thread_name = (
                     f"{severity_label} — {operator_card.title}"
                 )[:100]
+
+            content = _with_final_user_mention(
+                content,
+                metadata,
+                enabled=self._mention_user_on_final,
+            )
 
             # Determine target channel: thread_id in metadata takes precedence.
             thread_id = None
@@ -3460,7 +3559,24 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        if _final_user_mention_requested(
+            metadata,
+            enabled=self._mention_user_on_final,
+        ):
+            fresh_result = await self.send(
+                chat_id,
+                content,
+                metadata=metadata,
+            )
+            if fresh_result.success:
+                await self.delete_message(chat_id, message_id)
+            return fresh_result
         try:
+            content = _with_final_user_mention(
+                content,
+                metadata,
+                enabled=self._mention_user_on_final,
+            )
             channel = self._client.get_channel(int(chat_id))
             if not channel:
                 channel = await self._client.fetch_channel(int(chat_id))
@@ -3536,6 +3652,32 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:  # pragma: no cover - defensive logging
             logger.error("[%s] Failed to edit Discord message %s: %s", self.name, message_id, e, exc_info=True)
             return SendResult(success=False, error=str(e))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a bot-authored Discord message by channel and message ID."""
+        if not self._client:
+            return False
+        try:
+            channel = self._client.get_channel(int(chat_id))
+            if not channel:
+                channel = await self._client.fetch_channel(int(chat_id))
+            if not channel:
+                return False
+            message = await channel.fetch_message(int(message_id))
+            await message.delete()
+            self._last_overflow_preview.pop(
+                (str(chat_id), str(message_id)),
+                None,
+            )
+            return True
+        except Exception as e:
+            logger.debug(
+                "[%s] Failed to delete Discord message %s: %s",
+                self.name,
+                message_id,
+                e,
+            )
+            return False
 
     @staticmethod
     def _is_length_overflow_error(err: Exception) -> bool:
@@ -10182,21 +10324,20 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     The DiscordAdapter reads its runtime configuration via ``os.getenv()``
     throughout the connect / handle code paths (``DISCORD_ALLOWED_USERS``,
     ``DISCORD_REQUIRE_MENTION``, ``DISCORD_FREE_RESPONSE_CHANNELS``,
-    ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
+    ``DISCORD_THREADED_FREE_RESPONSE_CHANNELS``, ``DISCORD_AUTO_THREAD``,
+    ``DISCORD_REACTIONS``,
     ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
     ``DISCORD_BOTS_REQUIRE_INLINE_MENTION``).
-    Rather than rewrite ~50 call sites inside the adapter to read from
-    ``PlatformConfig.extra`` instead, this hook keeps the existing
-    env-driven model and merely owns the YAML→env translation here, next to
-    the adapter that consumes it.
+    Rather than rewrite ~50 unrelated call sites inside the adapter to read
+    from ``PlatformConfig.extra`` instead, this hook keeps their existing
+    env-driven model and owns their YAML→env translation here.
 
     ``PlatformConfig.extra`` is the per-adapter source of truth for liveness
-    settings, which keeps multiplexed profiles isolated. The legacy env bridge
-    remains only for existing callers that construct adapters without config
-    extras. Returns canonical WebSocket liveness settings to seed that extra.
+    and mention settings, which keeps multiplexed profiles isolated. Returns
+    canonical WebSocket liveness settings to seed that extra.
     """
     if "require_mention" in discord_cfg and not os.getenv("DISCORD_REQUIRE_MENTION"):
         os.environ["DISCORD_REQUIRE_MENTION"] = str(discord_cfg["require_mention"]).lower()
@@ -10310,20 +10451,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     hbl = discord_cfg.get("history_backfill_limit")
     if hbl is not None and not os.getenv("DISCORD_HISTORY_BACKFILL_LIMIT"):
         os.environ["DISCORD_HISTORY_BACKFILL_LIMIT"] = str(hbl)
-    # allow_mentions: granular control over what the bot can ping.
-    # Safe defaults (no @everyone/roles) are applied in the adapter;
-    # these YAML keys only override when set and let users opt back
-    # into unsafe modes (e.g. roles=true) if they actually want it.
-    allow_mentions_cfg = discord_cfg.get("allow_mentions")
-    if isinstance(allow_mentions_cfg, dict):
-        for yaml_key, env_key in (
-            ("everyone", "DISCORD_ALLOW_MENTION_EVERYONE"),
-            ("roles", "DISCORD_ALLOW_MENTION_ROLES"),
-            ("users", "DISCORD_ALLOW_MENTION_USERS"),
-            ("replied_user", "DISCORD_ALLOW_MENTION_REPLIED_USER"),
-        ):
-            if yaml_key in allow_mentions_cfg and not os.getenv(env_key):
-                os.environ[env_key] = str(allow_mentions_cfg[yaml_key]).lower()
     # reply_to_mode: top-level preferred, falls back to extra.reply_to_mode.
     # YAML 1.1 parses bare 'off' as boolean False — coerce to string "off".
     _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}

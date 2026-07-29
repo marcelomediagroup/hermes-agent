@@ -75,6 +75,12 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     """
     thread_id = getattr(source, "thread_id", None)
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    requester_user_id = getattr(source, "user_id", None)
+    if (
+        requester_user_id
+        and _platform_name(getattr(source, "platform", None)) == "discord"
+    ):
+        metadata["requester_user_id"] = str(requester_user_id)
     # Slack workspace identity is durable routing state, not ephemeral event
     # metadata. Carry it on every outbound path (including unthreaded sends)
     # so a multi-workspace Socket Mode gateway never falls back to its primary
@@ -6035,7 +6041,17 @@ class BasePlatformAdapter(ABC):
                 # the existing notify=True marker. Clone once so typing/status
                 # metadata stays unmarked and progress bubbles remain
                 # thread-strict.
-                _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
+                # The handler may replace event.source when an in-band queued
+                # follow-up belongs to another user in the same shared chat.
+                # Recompute final routing/notification metadata so the final
+                # mention targets that follow-up requester, not the user who
+                # started the outer run.
+                _final_thread_metadata = _mark_notify_metadata(
+                    _thread_metadata_for_source(
+                        event.source,
+                        _reply_anchor_for_event(event),
+                    )
+                )
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

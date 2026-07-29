@@ -6,6 +6,7 @@ import sys
 import time
 import types
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
@@ -474,6 +475,7 @@ async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch
         chat_id="chan-parent",
         chat_type="group",
         thread_id=None,
+        user_id="123456789012345678",
         prospective_thread_id="msg-anchor-1",
         delivered_via_upstream_relay=True,
     )
@@ -494,6 +496,7 @@ async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch
     for call in adapter.sent:
         assert call["reply_to"] == "msg-anchor-1", call
         assert (call["metadata"] or {}).get("reply_to_message_id") == "msg-anchor-1", call
+        assert (call["metadata"] or {}).get("requester_user_id") == "123456789012345678", call
         # Discord lifecycle/status sends are marked non-conversational.
         assert (call["metadata"] or {}).get("non_conversational") is True, call
 
@@ -877,7 +880,9 @@ async def _run_with_agent(
     platform=Platform.TELEGRAM,
     chat_id="-1001",
     chat_type="group",
-    thread_id="17585",
+    thread_id: Optional[str] = "17585",
+    user_id: Optional[str] = None,
+    pending_user_id: Optional[str] = None,
     adapter_cls=ProgressCaptureAdapter,
 ):
     if config_data:
@@ -905,15 +910,25 @@ async def _run_with_agent(
         chat_id=chat_id,
         chat_type=chat_type,
         thread_id=thread_id,
+        user_id=user_id,
     )
     session_key = f"agent:main:{platform.value}:{chat_type}:{chat_id}"
     if thread_id:
         session_key = f"{session_key}:{thread_id}"
     if pending_text is not None:
+        pending_source = source
+        if pending_user_id is not None:
+            pending_source = SessionSource(
+                platform=platform,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                thread_id=thread_id,
+                user_id=pending_user_id,
+            )
         adapter._pending_messages[session_key] = MessageEvent(
             text=pending_text,
             message_type=MessageType.TEXT,
-            source=source,
+            source=pending_source,
             message_id="queued-1",
         )
 
@@ -1019,10 +1034,11 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
             "display": {"tool_progress": "off", "interim_assistant_messages": False},
             "streaming": {"enabled": True, "edit_interval": 0.01, "buffer_threshold": 1},
         },
-        platform=Platform.MATRIX,
-        chat_id="!room:matrix.example.org",
+        platform=Platform.DISCORD,
+        chat_id="123456",
         chat_type="group",
-        thread_id="$thread",
+        thread_id=None,
+        user_id="123456789",
         adapter_cls=MetadataEditProgressCaptureAdapter,
     )
 
@@ -1034,6 +1050,163 @@ async def test_transformed_response_edits_streamed_message_in_place(monkeypatch,
     assert any("[plugin appended this]" in text for text in edited_texts), (
         f"expected transformed text in adapter.edits, got: {edited_texts!r}"
     )
+    transformed_edit = next(
+        edit for edit in adapter.edits if "[plugin appended this]" in edit["content"]
+    )
+    assert transformed_edit["metadata"] == {
+        "requester_user_id": "123456789",
+        "notify": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_run_agent_queued_message_does_not_treat_commentary_as_final(monkeypatch, tmp_path):
+    QueuedCommentaryAgent.calls = 0
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-commentary",
+        pending_text="queued follow-up",
+        config_data={"display": {"interim_assistant_messages": True}},
+        platform=Platform.DISCORD,
+        chat_id="123456",
+        chat_type="group",
+        thread_id=None,
+        user_id="123456789",
+    )
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert result["final_response"] == "final response 2"
+    assert "I'll inspect the repo first." in sent_texts
+    assert "final response 1" in sent_texts
+    first_response_send = next(
+        sent for sent in adapter.sent if sent["content"] == "final response 1"
+    )
+    assert first_response_send["metadata"] == {
+        "requester_user_id": "123456789",
+        "notify": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_queued_followup_returns_its_requester_as_delivery_source(
+    monkeypatch,
+    tmp_path,
+):
+    QueuedCommentaryAgent.calls = 0
+    _, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        QueuedCommentaryAgent,
+        session_id="sess-queued-two-users",
+        pending_text="queued follow-up",
+        config_data={"display": {"interim_assistant_messages": True}},
+        platform=Platform.DISCORD,
+        chat_id="123456",
+        chat_type="group",
+        thread_id=None,
+        user_id="111111111",
+        pending_user_id="222222222",
+    )
+
+    delivery_source = result["_delivery_source"]
+    assert delivery_source.user_id == "222222222"
+
+
+@pytest.mark.asyncio
+async def test_base_delivery_recomputes_metadata_after_source_replacement():
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    initial_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123456",
+        chat_type="group",
+        user_id="111111111",
+    )
+    followup_source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="123456",
+        chat_type="group",
+        user_id="222222222",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=initial_source,
+        message_id="event-1",
+    )
+
+    async def _handler(message_event):
+        message_event.source = followup_source
+        return "done"
+
+    adapter.set_message_handler(_handler)
+    session_key = "agent:main:discord:group:123456"
+    adapter._active_sessions[session_key] = asyncio.Event()
+
+    await adapter._process_message_background(event, session_key)
+
+    assert adapter.sent[0]["metadata"]["requester_user_id"] == "222222222"
+
+
+@pytest.mark.asyncio
+async def test_run_agent_defers_background_review_notification_until_release(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        BackgroundReviewAgent,
+        session_id="sess-bg-review-order",
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent == []
+
+
+@pytest.mark.asyncio
+async def test_base_processing_releases_post_delivery_callback_after_main_send():
+    """Post-delivery callbacks on the adapter fire after the main response."""
+    adapter = ProgressCaptureAdapter()
+
+    async def _handler(event):
+        return "done"
+
+    adapter.set_message_handler(_handler)
+
+    released = []
+
+    def _post_delivery_cb():
+        released.append(True)
+        adapter.sent.append(
+            {
+                "chat_id": "bg-review",
+                "content": "💾 Skill 'prospect-scanner' created.",
+                "reply_to": None,
+                "metadata": None,
+            }
+        )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="17585",
+    )
+    event = MessageEvent(
+        text="hello",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="msg-1",
+    )
+    session_key = "agent:main:telegram:group:-1001:17585"
+    adapter._active_sessions[session_key] = asyncio.Event()
+    adapter._post_delivery_callbacks[session_key] = _post_delivery_cb
+
+    await adapter._process_message_background(event, session_key)
+
+    sent_texts = [call["content"] for call in adapter.sent]
+    assert sent_texts == ["done", "💾 Skill 'prospect-scanner' created."]
+    assert released == [True]
 
 
 @pytest.mark.asyncio

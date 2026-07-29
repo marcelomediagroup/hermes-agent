@@ -347,6 +347,20 @@ class GatewayStreamConsumer:
             meta["notify"] = True
         return meta or None
 
+    def _needs_final_user_mention(self) -> bool:
+        requester_user_id = str(
+            (self.metadata or {}).get("requester_user_id") or ""
+        ).strip()
+        return bool(
+            requester_user_id.isdigit()
+            and getattr(
+                self.adapter,
+                "mention_user_on_final_enabled",
+                False,
+            )
+            is True
+        )
+
     @property
     def already_sent(self) -> bool:
         """True if at least one message was sent or edited during the run."""
@@ -388,9 +402,10 @@ class GatewayStreamConsumer:
         message_id: str,
         content: str,
         finalize: bool = False,
+        notify: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "chat_id": self.chat_id,
             "message_id": message_id,
             "content": content,
@@ -406,7 +421,10 @@ class GatewayStreamConsumer:
                     param.kind is inspect.Parameter.VAR_KEYWORD
                     for param in params.values()
                 ):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = self._metadata_for_send(
+                        final=notify,
+                        expect_edits=not finalize,
+                    )
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -920,7 +938,7 @@ class GatewayStreamConsumer:
                             new_id = await self._send_new_chunk(
                                 chunk,
                                 reply_to,
-                                final=got_done,
+                                final=False,
                             )
                             if new_id is None or new_id == reply_to:
                                 # Failed to deliver a sealed head; keep the
@@ -947,7 +965,6 @@ class GatewayStreamConsumer:
                             self._message_id = None
                             self._message_created_ts = None
                             self._last_sent_text = ""
-
                         if chunks_delivered:
                             # A sealed head is on screen, so this turn is now a
                             # multi-message delivery.  Flag it BEFORE the tail
@@ -1406,6 +1423,44 @@ class GatewayStreamConsumer:
             if final_text.strip() and final_text != self._visible_prefix():
                 continuation = final_text
             else:
+                # A Discord preview that already contains the complete answer
+                # is not necessarily a completed notification: final-only
+                # mention mode adds the requester mention on the terminal
+                # edit.  Retry that notify-worthy edit here before declaring
+                # delivery.  If it still fails, clear the visible-prefix
+                # bookkeeping so the gateway's normal final-send path can
+                # send a fresh mentioned response instead of suppressing it.
+                notification_required = bool(
+                    final_text.strip()
+                    and self._needs_final_user_mention()
+                )
+                if notification_required:
+                    result = None
+                    if self._message_id:
+                        try:
+                            result = await self._edit_message(
+                                message_id=self._message_id,
+                                content=final_text,
+                                finalize=True,
+                                notify=True,
+                            )
+                        except Exception:
+                            pass
+                    if result is not None and result.success:
+                        self._last_sent_text = final_text
+                        self._already_sent = True
+                        self._final_response_sent = True
+                        self._final_content_delivered = True
+                        return
+                    self._already_sent = False
+                    self._final_response_sent = False
+                    self._final_content_delivered = False
+                    self._message_id = None
+                    self._last_sent_text = ""
+                    self._fallback_prefix = ""
+                    self._fallback_preserve_partial_messages = False
+                    return
+
                 # Defence-in-depth for #7183: the last edit may still show the
                 # cursor character because fallback mode was entered after an
                 # edit failure left it stuck.  Try one final edit to strip it
@@ -1462,14 +1517,14 @@ class GatewayStreamConsumer:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
             # Try sending with one retry on flood-control errors.
             result = None
             for attempt in range(2):
                 result = await self.adapter.send(
                     chat_id=self.chat_id,
                     content=chunk,
-                    metadata=self._metadata_for_send(final=True),
+                    metadata=self._metadata_for_send(final=chunk_index == 0),
                 )
                 if result.success:
                     break
@@ -1967,7 +2022,7 @@ class GatewayStreamConsumer:
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,
-                metadata=self._metadata_for_send(final=True),
+                metadata=self._metadata_for_send(final=is_turn_final),
             )
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
@@ -2144,8 +2199,17 @@ class GatewayStreamConsumer:
                     # finalize=True edit even when content is unchanged, so
                     # their streaming UI can transition out of the in-
                     # progress state.  Everyone else short-circuits.
+                    needs_final_notification_edit = bool(
+                        finalize
+                        and is_turn_final
+                        and self._needs_final_user_mention()
+                    )
                     if text == self._last_sent_text and not (
-                        finalize and self._adapter_requires_finalize
+                        finalize
+                        and (
+                            self._adapter_requires_finalize
+                            or needs_final_notification_edit
+                        )
                     ):
                         return True
                     # Fresh-final for long-lived previews: when finalizing
@@ -2207,6 +2271,7 @@ class GatewayStreamConsumer:
                         message_id=self._message_id,
                         content=text,
                         finalize=finalize,
+                        notify=finalize and is_turn_final,
                     )
                     if result.success:
                         self._already_sent = True
@@ -2237,6 +2302,20 @@ class GatewayStreamConsumer:
                             self._message_id = str(result.message_id)
                             self._message_created_ts = time.monotonic()
                             self._last_sent_text = ""
+                            self._notify_new_message()
+                        elif (
+                            finalize
+                            and getattr(result, "message_id", None)
+                            and getattr(result, "message_id", None)
+                            != self._message_id
+                        ):
+                            # Some platforms commit a notify-worthy final by
+                            # replacing the editable preview with a fresh
+                            # message. Adopt that new id even though the
+                            # adapter operation entered through edit_message.
+                            self._message_id = str(result.message_id)
+                            self._message_created_ts = time.monotonic()
+                            self._last_sent_text = text
                             self._notify_new_message()
                         else:
                             self._last_sent_text = text
@@ -2370,7 +2449,7 @@ class GatewayStreamConsumer:
                     content=text,
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
-                        final=finalize,
+                        final=finalize and is_turn_final,
                         expect_edits=True,
                     ),
                 )

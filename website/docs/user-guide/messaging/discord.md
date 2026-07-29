@@ -309,10 +309,11 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_HISTORY_BACKFILL` | No | `true` | When `true`, prepend recent channel scrollback (since the bot's last response) to the user message when the bot is mentioned. Recovers context the bot would otherwise miss with `require_mention`. Skipped in DMs and free-response channels. Set to `false` to disable. |
 | `DISCORD_HISTORY_BACKFILL_LIMIT` | No | `50` | Maximum number of messages to scan backwards when assembling the backfill block. In practice the scan usually stops earlier — at the bot's own last message in the channel. |
 | `DISCORD_REPLY_TO_MODE` | No | `"first"` | Controls reply-reference behavior: `"off"` — never reply to the original message, `"first"` — reply-reference on the first message chunk only (default), `"all"` — reply-reference on every chunk. |
+| `DISCORD_MENTION_USER_ON_FINAL` | No | `false` | When `true`, prefix the turn-final response with an explicit mention of the requesting user. Tool progress, interim commentary, and pre-tool messages stay unmentioned, which supports mention-only Discord notifications. |
 | `DISCORD_ALLOW_MENTION_EVERYONE` | No | `false` | When `false` (default), the bot cannot ping `@everyone` or `@here` even if its response contains those tokens. Set to `true` to opt back in. See [Mention Control](#mention-control) below. |
 | `DISCORD_ALLOW_MENTION_ROLES` | No | `false` | When `false` (default), the bot cannot ping `@role` mentions. Set to `true` to allow. |
 | `DISCORD_ALLOW_MENTION_USERS` | No | `true` | When `true` (default), the bot can ping individual users by ID. |
-| `DISCORD_ALLOW_MENTION_REPLIED_USER` | No | `true` | When `true` (default), replying to a message pings the original author. |
+| `DISCORD_ALLOW_MENTION_REPLIED_USER` | No | `true` (`false` in final-mention mode) | When `true`, replying to a message pings the original author. An explicit value overrides the final-mention default. |
 | `DISCORD_PROXY` | No | — | Proxy URL for Discord connections (HTTP, WebSocket, REST). Overrides `HTTPS_PROXY`/`ALL_PROXY`. Supports `http://`, `https://`, and `socks5://` schemes. |
 | `DISCORD_ALLOW_ANY_ATTACHMENT` | No | `false` | When `true`, the bot accepts attachments of any file type (not just the built-in PDF/text/zip/office allowlist). Unknown types are cached to disk and surfaced to the agent as a local path with `application/octet-stream` MIME so it can inspect them with `terminal` / `read_file` / `ffprobe` / etc. |
 | `DISCORD_MAX_ATTACHMENT_BYTES` | No | `33554432` | Maximum bytes per attachment the gateway will download and cache. Default 32 MiB. Set to `0` for no cap (attachments are held in memory while being written, so unlimited carries a real memory cost). |
@@ -337,6 +338,7 @@ discord:
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
   reactions: true                 # Add emoji reactions during processing
+  mention_user_on_final: false    # Mention the requester on the final response only
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
@@ -920,11 +922,14 @@ This is the preferred pattern when the moderation team churns — new moderators
 
 By default, Hermes blocks the bot from pinging `@everyone`, `@here`, and role mentions, even if its reply contains those tokens. This prevents a poorly-worded prompt or echoed user content from spamming a whole server. Individual `@user` pings and reply-reference pings (the little "replying to…" chip) stay enabled so normal conversation still works.
 
+To use mention-only Discord notifications, set `mention_user_on_final: true`. Hermes then sends the turn-final response as a fresh message starting with the requesting user's explicit `<@user_id>` mention, because adding a mention through a streaming edit does not generate a new Discord push notification. Any stale streaming preview is deleted best-effort. Tool progress and interim messages stay unmentioned, and proactive messages without a requesting user are unchanged. Keep `allow_mentions.users: true` so Discord delivers the ping. Final-mention mode also defaults `allow_mentions.replied_user` to `false`, preventing ordinary reply references from generating early notifications; setting it explicitly to `true` overrides that safeguard.
+
 You can relax these defaults via either env vars or `config.yaml`:
 
 ```yaml
 # ~/.hermes/config.yaml
 discord:
+  mention_user_on_final: true
   allow_mentions:
     everyone: false      # allow the bot to ping @everyone / @here
     roles: false         # allow the bot to ping @role mentions
@@ -945,5 +950,4 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
 

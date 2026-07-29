@@ -2406,6 +2406,7 @@ from gateway.platforms.base import (
     EphemeralReply,
     MessageEvent,
     MessageType,
+    _mark_notify_metadata,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     build_auto_tts_output_path,
@@ -17910,6 +17911,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
+            _delivery_source = agent_result.get("_delivery_source")
+            if _delivery_source is not None:
+                # A queued in-band follow-up can belong to a different user in
+                # the same shared Discord thread. Route the returned final to
+                # that event's source rather than the source that began the
+                # outer run.
+                source = _delivery_source
+                event.source = _delivery_source
+
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
             # same routing metadata used by the response delivery path.
@@ -21034,6 +21044,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None),
         )
+        requester_user_id = getattr(source, "user_id", None)
+        if (
+            requester_user_id
+            and getattr(source, "platform", None) == Platform.DISCORD
+        ):
+            metadata = dict(metadata or {})
+            metadata["requester_user_id"] = str(requester_user_id)
         if getattr(source, "platform", None) == Platform.SLACK:
             team_id = getattr(source, "scope_id", None)
             if team_id:
@@ -25338,10 +25355,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 reply_to_message_id=event_message_id,
             )
         ) if _progress_thread_id else None
-        if _progress_metadata is None and _relay_prospective_thread_id:
+        if _relay_prospective_thread_id:
             # No real thread yet, but the connector will auto-thread on the
-            # reply anchor; carry it so progress joins that thread.
-            _progress_metadata = {"reply_to_message_id": event_message_id}
+            # reply anchor; carry it so progress joins that thread. Preserve
+            # requester identity when final-only Discord mentions are enabled.
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata.setdefault("reply_to_message_id", event_message_id)
         _progress_metadata = _non_conversational_metadata(_progress_metadata, platform=source.platform)
         _progress_reply_to = (
             event_message_id
@@ -25421,7 +25440,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         turn_ctx.agent_holder = agent_holder
         result_holder = [None]  # Mutable container for the result
         tools_holder = [None]   # Mutable container for the tool definitions
-        stream_consumer_holder = [None]  # Mutable container for stream consumer
+        stream_consumer_holder: list[Any] = [None]  # Mutable container for stream consumer
         # #60671 — streaming PCM audio consumer.  Created on the gateway
         # event-loop thread (NOT inside run_sync's executor worker) so the
         # outer finalisation / interrupt paths can reference it without a
@@ -25460,24 +25479,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "reply_to_message_id": event_message_id,
             }
         else:
-            _status_thread_metadata = (
-                self._thread_metadata_for_source(source, event_message_id)
-                if _progress_thread_id == source.thread_id
-                else self._thread_metadata_for_target(
+            # Requester identity is needed for final-only Discord mentions even
+            # when the conversation is not inside a thread. Tool/progress sends
+            # carry this metadata without notify=True, so they remain silent.
+            _source_status_metadata = self._thread_metadata_for_source(
+                source,
+                event_message_id,
+            )
+            if _progress_thread_id and _progress_thread_id != source.thread_id:
+                _status_thread_metadata = self._thread_metadata_for_target(
                     source.platform,
                     source.chat_id,
                     _progress_thread_id,
                     chat_type=getattr(source, "chat_type", None),
                     reply_to_message_id=event_message_id,
                 )
-            ) if _progress_thread_id else None
-            if _status_thread_metadata is None and _relay_prospective_thread_id:
+                if _source_status_metadata and "requester_user_id" in _source_status_metadata:
+                    _status_thread_metadata = dict(_status_thread_metadata or {})
+                    _status_thread_metadata["requester_user_id"] = _source_status_metadata[
+                        "requester_user_id"
+                    ]
+            else:
+                _status_thread_metadata = _source_status_metadata
+            if _relay_prospective_thread_id:
                 # Relay Discord auto-thread lane (see _progress_metadata above):
                 # carry the reply anchor so status/interim bubbles route into
                 # the same connector-created thread as the final reply.
-                _status_thread_metadata = {
-                    "reply_to_message_id": event_message_id
-                }
+                _status_thread_metadata = dict(_status_thread_metadata or {})
+                _status_thread_metadata.setdefault(
+                    "reply_to_message_id",
+                    event_message_id,
+                )
 
         # Bridge extracted to TurnRunner._status_callback_sync; publish the
         # status wiring computed above onto the shared TurnContext at the
@@ -26337,7 +26369,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await adapter.send(
                                 source.chat_id,
                                 first_response,
-                                metadata=_status_thread_metadata,
+                                metadata=_mark_notify_metadata(
+                                    _status_thread_metadata
+                                ),
                             )
                         except Exception as e:
                             logger.warning("Failed to send first response before queued message: %s", e)
@@ -26473,6 +26507,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     channel_prompt=next_channel_prompt,
                     message_type=next_message_type,
                 )
+                if isinstance(followup_result, dict):
+                    followup_result.setdefault("_delivery_source", next_source)
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:
             # Stop progress sender, interrupt monitor, and notification task
@@ -26671,17 +26707,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _sc_msg_id = _sc.message_id
                 if _sc_msg_id:
                     try:
-                        await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
+                        _edit_result = await _sc._edit_message(
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
+                            notify=True,
                         )
-                        response["already_sent"] = True
-                        logger.info(
-                            "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
-                        )
+                        if _edit_result.success:
+                            response["already_sent"] = True
+                            logger.info(
+                                "Edited streamed message %s for session %s to include plugin-transformed content.",
+                                _sc_msg_id, session_key or "?",
+                            )
+                        else:
+                            logger.warning(
+                                "Failed to edit streamed message for session %s: %s",
+                                session_key or "?",
+                                _edit_result.error or "unknown adapter error",
+                            )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",

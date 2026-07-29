@@ -1614,6 +1614,14 @@ def load_gateway_config() -> GatewayConfig:
                     for _bridge_key in ("port", "host"):
                         if _bridge_key in platform_cfg and _bridge_key not in platform_cfg.get("extra", {}):
                             bridged[_bridge_key] = platform_cfg[_bridge_key]
+                if plat == Platform.DISCORD and "mention_user_on_final" in platform_cfg:
+                    bridged["mention_user_on_final"] = platform_cfg[
+                        "mention_user_on_final"
+                    ]
+                if plat == Platform.DISCORD and "allow_mentions" in platform_cfg:
+                    allow_mentions = platform_cfg["allow_mentions"]
+                    if isinstance(allow_mentions, dict):
+                        bridged["allow_mentions"] = dict(allow_mentions)
                 has_channel_overrides = "channel_overrides" in platform_cfg
                 if has_channel_overrides:
                     raw_overrides = platform_cfg.get("channel_overrides")
