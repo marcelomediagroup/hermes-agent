@@ -84,9 +84,10 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import _build_allowed_mentions  # noqa: E402
 
 
-# The four DISCORD_ALLOW_MENTION_* env vars that _build_allowed_mentions reads.
+# Mention-related env vars that _build_allowed_mentions reads.
 # Cleared before each test so env leakage from other tests never masks a regression.
 _ENV_VARS = (
+    "DISCORD_MENTION_USER_ON_FINAL",
     "DISCORD_ALLOW_MENTION_EVERYONE",
     "DISCORD_ALLOW_MENTION_ROLES",
     "DISCORD_ALLOW_MENTION_USERS",
@@ -118,3 +119,60 @@ def test_env_var_opts_back_into_everyone(monkeypatch):
     assert am.replied_user is True
 
 
+def test_env_var_can_disable_users(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_USERS", "false")
+    am = _build_allowed_mentions()
+    assert am.users is False
+    # safe defaults elsewhere remain
+    assert am.everyone is False
+    assert am.roles is False
+    assert am.replied_user is True
+
+
+def test_instance_config_applies_without_global_env():
+    am = _build_allowed_mentions(
+        configured={
+            "everyone": False,
+            "roles": False,
+            "users": True,
+            "replied_user": False,
+        },
+        mention_user_on_final=True,
+    )
+    assert am.everyone is False
+    assert am.roles is False
+    assert am.users is True
+    assert am.replied_user is False
+
+
+def test_env_override_wins_over_instance_config(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_USERS", "false")
+    am = _build_allowed_mentions(configured={"users": True})
+    assert am.users is False
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("true", True), ("True", True), ("TRUE", True),
+    ("1", True), ("yes", True), ("YES", True), ("on", True),
+    ("false", False), ("False", False), ("0", False),
+    ("no", False), ("off", False),
+    ("", False),                 # empty falls back to default (False for everyone)
+    ("garbage", False),          # unknown falls back to default
+    (" true ", True),            # whitespace tolerated
+])
+def test_everyone_boolean_parsing(monkeypatch, raw, expected):
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", raw)
+    am = _build_allowed_mentions()
+    assert am.everyone is expected
+
+
+def test_all_four_knobs_together(monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_EVERYONE", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_ROLES", "true")
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_USERS", "false")
+    monkeypatch.setenv("DISCORD_ALLOW_MENTION_REPLIED_USER", "false")
+    am = _build_allowed_mentions()
+    assert am.everyone is True
+    assert am.roles is True
+    assert am.users is False
+    assert am.replied_user is False
