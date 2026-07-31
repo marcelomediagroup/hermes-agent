@@ -113,6 +113,7 @@ def _make_adapter(fx_cfg=None):
     adapter._ack_pcm_cache = {}
     adapter._ack_pcm_locks = {}
     adapter._ack_prewarm_task = None
+    adapter._missed_message_backfill_task = None
     adapter._voice_fx_cfg = fx_cfg if fx_cfg is not None else {
         "enabled": True, "ambient_enabled": True, "ambient_path": "",
         "ambient_gain": 0.18, "duck_gain": 0.06, "speech_gain": 1.0,
