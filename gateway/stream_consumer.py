@@ -931,23 +931,28 @@ class GatewayStreamConsumer:
                             chunks = self._split_text_chunks(
                                 self._accumulated, _safe_limit, _len_fn,
                             )
-                        chunks_delivered = False
+                        notification_delivered = False
+                        any_head_delivered = False
                         reply_to = self._initial_reply_to_id
                         all_heads_delivered = len(chunks) > 1
                         for chunk in chunks[:-1]:
+                            notify_this_chunk = (
+                                got_done and not notification_delivered
+                            )
                             new_id = await self._send_new_chunk(
                                 chunk,
                                 reply_to,
-                                final=False,
+                                final=notify_this_chunk,
                             )
                             if new_id is None or new_id == reply_to:
                                 # Failed to deliver a sealed head; keep the
                                 # full accumulated text intact so the gateway's
                                 # fallback path can still deliver it completely.
                                 all_heads_delivered = False
-                                chunks_delivered = False
                                 break
-                            chunks_delivered = True
+                            any_head_delivered = True
+                            if notify_this_chunk:
+                                notification_delivered = True
                             reply_to = new_id
 
                         if all_heads_delivered:
@@ -965,7 +970,7 @@ class GatewayStreamConsumer:
                             self._message_id = None
                             self._message_created_ts = None
                             self._last_sent_text = ""
-                        if chunks_delivered:
+                        if any_head_delivered:
                             # A sealed head is on screen, so this turn is now a
                             # multi-message delivery.  Flag it BEFORE the tail
                             # send below: the fresh-final route replaces every
@@ -980,12 +985,15 @@ class GatewayStreamConsumer:
                             tail_delivered = True
                             if self._accumulated:
                                 tail_delivered = await self._send_or_edit(
-                                    self._accumulated, finalize=True,
+                                    self._accumulated,
+                                    finalize=True,
+                                    is_turn_final=not notification_delivered,
                                 )
-                            # Only claim final delivery if the sealed chunks and
-                            # final tail actually landed.  ``_already_sent`` may
-                            # be True from prior progress/fallback state (#10748).
-                            self._final_response_sent = chunks_delivered and tail_delivered
+                            # If every sealed head landed, the tail completes
+                            # the response. If any head failed, _accumulated
+                            # still contains the complete payload, so a
+                            # successful tail send also completes the response.
+                            self._final_response_sent = tail_delivered
                             if self._final_response_sent:
                                 self._final_content_delivered = True
                                 # Multi-message split delivery — record the
