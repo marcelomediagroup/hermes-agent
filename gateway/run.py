@@ -15764,7 +15764,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as exc:
                 logger.warning("Bundle dispatch failed: %s", exc)
 
-        if command and not locals().get("_bundle_handled", False):
+        # Registry-known commands that intentionally fall through to the agent
+        # (for example /learn) must bypass skill discovery entirely.  On a cold
+        # cache get_skill_commands() synchronously scans every skill root.
+        # Normalize first because quick-command aliases and Telegram may use
+        # underscored forms for hyphenated built-ins.
+        if (
+            command
+            and command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS
+            and not locals().get("_bundle_handled", False)
+        ):
             try:
                 from agent.skill_commands import (
                     get_skill_commands,
@@ -15853,22 +15862,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the user instead of silently forwarding it to the LLM
                     # as free text (which leads to silent-failure behavior
                     # like the model inventing a delegate_task call).
-                    # Normalize to hyphenated form before checking known
-                    # built-ins (command may be an alias target set by the
-                    # quick-command block above, so _cmd_def can be stale).
-                    if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
-                        logger.warning(
-                            "Unrecognized slash command /%s from %s — "
-                            "replying with unknown-command notice",
-                            command,
-                            source.platform.value if source.platform else "?",
-                        )
-                        return (
-                            f"Unknown command `/{command}`. "
-                            f"Type /commands to see what's available, "
-                            f"or resend without the leading slash to send "
-                            f"as a regular message."
-                        )
+                    logger.warning(
+                        "Unrecognized slash command /%s from %s — "
+                        "replying with unknown-command notice",
+                        command,
+                        source.platform.value if source.platform else "?",
+                    )
+                    return (
+                        f"Unknown command `/{command}`. "
+                        f"Type /commands to see what's available, "
+                        f"or resend without the leading slash to send "
+                        f"as a regular message."
+                    )
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
