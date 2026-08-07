@@ -25344,17 +25344,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and not source.thread_id
             else None
         )
-        _progress_metadata = (
-            self._thread_metadata_for_source(source, event_message_id)
-            if _progress_thread_id == source.thread_id
-            else self._thread_metadata_for_target(
+        _source_progress_metadata = self._thread_metadata_for_source(
+            source,
+            event_message_id,
+        )
+        if _progress_thread_id and _progress_thread_id != source.thread_id:
+            _progress_metadata = self._thread_metadata_for_target(
                 source.platform,
                 source.chat_id,
                 _progress_thread_id,
                 chat_type=getattr(source, "chat_type", None),
                 reply_to_message_id=event_message_id,
             )
-        ) if _progress_thread_id else None
+            if (
+                _source_progress_metadata
+                and "requester_user_id" in _source_progress_metadata
+            ):
+                _progress_metadata = dict(_progress_metadata or {})
+                _progress_metadata["requester_user_id"] = _source_progress_metadata[
+                    "requester_user_id"
+                ]
+        else:
+            _progress_metadata = _source_progress_metadata
         if _relay_prospective_thread_id:
             # No real thread yet, but the connector will auto-thread on the
             # reply anchor; carry it so progress joins that thread. Preserve
