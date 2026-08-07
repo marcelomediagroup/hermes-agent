@@ -134,6 +134,52 @@ async def test_known_slash_command_not_flagged_as_unknown(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_learn_builtin_skips_skill_discovery(monkeypatch):
+    """A fall-through built-in must reach the agent without discovering skills."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._draining = False
+    runner._external_drain_active = False
+    runner._is_telegram_topic_root_lobby = lambda _source: False
+    runner._claim_active_session_slot = MagicMock(return_value=(None, None))
+    runner._session_state = MagicMock(
+        return_value=SimpleNamespace(
+            turn=SimpleNamespace(lease=None, agent=None, started_ts=None)
+        )
+    )
+    runner._persist_active_agents = MagicMock()
+    runner._begin_session_run_generation = MagicMock(return_value=1)
+    runner._handle_message_with_agent = AsyncMock(
+        return_value={"final_response": "", "messages": []}
+    )
+    runner._clear_durable_active_turn = AsyncMock()
+    runner._release_running_agent_state = MagicMock()
+
+    active_skill_scan = MagicMock(
+        side_effect=AssertionError("known /learn command scanned active skills")
+    )
+    unavailable_skill_check = MagicMock(
+        side_effect=AssertionError("known /learn command scanned unavailable skills")
+    )
+    monkeypatch.setattr(
+        "agent.skill_commands.get_skill_commands", active_skill_scan
+    )
+    monkeypatch.setattr(
+        gateway_run, "_check_unavailable_skill", unavailable_skill_check
+    )
+
+    event = _make_event("/learn https://docs.getjumper.io/")
+    result = await runner._handle_message(event)
+
+    assert result == {"final_response": "", "messages": []}
+    active_skill_scan.assert_not_called()
+    unavailable_skill_check.assert_not_called()
+    runner._handle_message_with_agent.assert_awaited_once()
+    assert "https://docs.getjumper.io/" in event.text
+
+
+@pytest.mark.asyncio
 async def test_egress_slash_command_reports_proxy_status(monkeypatch):
     runner = _make_runner()
     monkeypatch.setattr(
