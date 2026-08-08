@@ -141,6 +141,11 @@ except ImportError:
     from ffmpeg_utils import resolve_ffmpeg_executable
 
 from gateway.config import Platform, PlatformConfig
+from gateway.operator_actions import (
+    OperatorActionDispatcher,
+    OperatorActionPersistenceError,
+    OperatorActionRegistration,
+)
 from gateway.operator_cards import OperatorCard, render_operator_card_text
 
 from gateway.platforms.helpers import (
@@ -244,6 +249,7 @@ _DISCORD_OPERATOR_CARD_SEVERITY_LABELS = {
     "blocked": "Blocked",
     "critical": "Critical",
 }
+_DISCORD_OPERATOR_ACTION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
 def _build_operator_card_embed(card: OperatorCard) -> Any:
@@ -271,6 +277,40 @@ def _build_operator_card_embed(card: OperatorCard) -> Any:
     severity_label = _DISCORD_OPERATOR_CARD_SEVERITY_LABELS[card.severity]
     embed.set_footer(text=f"{card_type_label} · {severity_label}")
     return embed
+
+
+def _build_operator_card_view(
+    card: OperatorCard,
+    registration: OperatorActionRegistration,
+) -> Any:
+    """Render validated card actions as opaque durable Discord buttons."""
+    style_map = {
+        "primary": discord.ButtonStyle.primary,
+        "secondary": discord.ButtonStyle.secondary,
+        "success": discord.ButtonStyle.success,
+        "danger": discord.ButtonStyle.danger,
+        # A Discord link button cannot carry a custom_id and would bypass the
+        # durable dispatcher. Keep the label but render it as a normal intent
+        # button; actual outbound links remain in ``card.links``.
+        "link": discord.ButtonStyle.secondary,
+    }
+    view = discord.ui.View(timeout=None)
+    dynamic_item_cls = globals().get("OperatorActionDynamicItem")
+    for action in card.actions:
+        button = discord.ui.Button(
+            label=action.label,
+            style=style_map[action.style],
+            custom_id=registration.custom_id(action.id),
+        )
+        if isinstance(dynamic_item_cls, type):
+            view.add_item(dynamic_item_cls(button))
+        else:
+            # Test doubles and older discord.py imports can lack DynamicItem.
+            # Runtime startup fails closed before sending actionable cards on
+            # those versions; retaining the button here keeps pure rendering
+            # tests independent from discord.py's dispatcher internals.
+            view.add_item(button)
+    return view
 
 
 async def _wait_for_ready_or_bot_exit(
@@ -1246,6 +1286,9 @@ class DiscordAdapter(BasePlatformAdapter):
         # Persistent set of bot-authored lifecycle/status message IDs that
         # should not act as conversational history boundaries after restart.
         self._nonconversational_messages = _DiscordNonConversationalMessageTracker()
+        self._operator_actions = OperatorActionDispatcher()
+        self._operator_action_router_install_attempted = False
+        self._operator_action_router_installed = False
         # Last truncated mid-stream preview delivered per (chat_id, message_id).
         # Once an oversized streaming edit saturates at the 2000-char preview
         # cap, every subsequent progressive edit truncates to the SAME text;
@@ -1469,6 +1512,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 ),
                 **proxy_kwargs_for_bot(proxy_url),
             )
+            self._install_operator_action_router(self._client)
             adapter_self = self  # capture for closure
 
             # Register event handlers
@@ -3245,6 +3289,7 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             operator_card = None
             operator_card_embed = None
+            operator_card_view = None
             operator_card_thread_name = None
             if metadata and "operator_card" in metadata:
                 operator_card = OperatorCard.from_mapping(metadata["operator_card"])
@@ -3259,6 +3304,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 operator_card_thread_name = (
                     f"{severity_label} — {operator_card.title}"
                 )[:100]
+                if operator_card.actions:
+                    if (
+                        self._operator_action_router_install_attempted
+                        and not self._operator_action_router_installed
+                    ):
+                        raise OperatorActionPersistenceError(
+                            "persistent Discord operator action routing is unavailable"
+                        )
+                    registration = await asyncio.to_thread(
+                        self._operator_actions.register_card,
+                        operator_card,
+                        ttl_seconds=_DISCORD_OPERATOR_ACTION_TTL_SECONDS,
+                    )
+                    operator_card_view = _build_operator_card_view(
+                        operator_card,
+                        registration,
+                    )
 
             content = _with_final_user_mention(
                 content,
@@ -3294,6 +3356,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     channel,
                     content,
                     embed=operator_card_embed,
+                    view=operator_card_view,
                     thread_name=operator_card_thread_name,
                 )
                 await asyncio.to_thread(
@@ -3325,6 +3388,8 @@ class DiscordAdapter(BasePlatformAdapter):
                     }
                     if i == 0 and operator_card_embed is not None:
                         send_kwargs["embed"] = operator_card_embed
+                    if i == 0 and operator_card_view is not None:
+                        send_kwargs["view"] = operator_card_view
                     msg = await channel.send(**send_kwargs)
                 except Exception as e:
                     err_text = str(e)
@@ -3391,6 +3456,7 @@ class DiscordAdapter(BasePlatformAdapter):
         content: str,
         *,
         embed: Any = None,
+        view: Any = None,
         thread_name: Optional[str] = None,
     ) -> SendResult:
         """Create a thread post in a forum channel with the message as starter content.
@@ -3418,6 +3484,8 @@ class DiscordAdapter(BasePlatformAdapter):
             }
             if embed is not None:
                 create_kwargs["embed"] = embed
+            if view is not None:
+                create_kwargs["view"] = view
             thread = await forum_channel.create_thread(**create_kwargs)
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
@@ -5244,6 +5312,92 @@ class DiscordAdapter(BasePlatformAdapter):
             )
 
         return (True, None)
+
+    def _install_operator_action_router(self, client: Any) -> None:
+        """Install one global persistent component route on this Discord client."""
+        self._operator_action_router_install_attempted = True
+        self._operator_action_router_installed = False
+        dynamic_item_cls = globals().get("OperatorActionDynamicItem")
+        add_dynamic_items = getattr(client, "add_dynamic_items", None)
+        if not isinstance(dynamic_item_cls, type) or not callable(add_dynamic_items):
+            logger.warning(
+                "[Discord] Persistent operator actions are unavailable because "
+                "this Discord client lacks DynamicItem support"
+            )
+            return
+        client._hermes_operator_action_handler = (  # type: ignore[attr-defined]
+            self._handle_operator_action_interaction
+        )
+        add_dynamic_items(dynamic_item_cls)
+        self._operator_action_router_installed = True
+
+    async def _handle_operator_action_interaction(
+        self,
+        interaction: "discord.Interaction",
+        registration_id: str,
+        action_id: str,
+    ) -> None:
+        """Resolve one persistent operator button through durable local state."""
+        if not await self._check_slash_authorization(
+            interaction,
+            f"operator action {action_id}",
+        ):
+            return
+
+        # Acknowledge before filesystem work so Discord's three-second
+        # interaction deadline cannot turn a durable local decision into an
+        # opaque "interaction failed" banner. Component defer is a message
+        # update acknowledgement; ``edit_original_response`` below edits the
+        # same card message rather than creating a second response.
+        try:
+            await interaction.response.defer()
+        except Exception as exc:
+            logger.warning(
+                "[Discord] Could not acknowledge operator action %s: %s",
+                action_id,
+                exc,
+            )
+            return
+
+        user = getattr(interaction, "user", None)
+        actor_id = str(getattr(user, "id", "") or "unknown")
+        actor_display = str(
+            getattr(user, "display_name", None)
+            or getattr(user, "name", None)
+            or "Unknown Discord user"
+        )
+        try:
+            outcome = await asyncio.to_thread(
+                self._operator_actions.dispatch,
+                registration_id=registration_id,
+                action_id=action_id,
+                actor_id=actor_id,
+                actor_display=actor_display,
+            )
+        except OperatorActionPersistenceError as exc:
+            logger.error(
+                "[Discord] Operator action storage unavailable: %s",
+                exc,
+                exc_info=True,
+            )
+            outcome = self._operator_actions.blocked_outcome(action_id=action_id)
+
+        try:
+            await interaction.edit_original_response(
+                content=render_operator_card_text(
+                    outcome.card,
+                    max_length=self.MAX_MESSAGE_LENGTH,
+                ),
+                embed=_build_operator_card_embed(outcome.card),
+                view=None,
+            )
+        except Exception as exc:
+            logger.error(
+                "[Discord] Failed to render terminal operator action %s: %s",
+                outcome.result,
+                exc,
+                exc_info=True,
+            )
 
     async def _check_slash_authorization(
         self, interaction: "discord.Interaction", command_text: str,
@@ -8788,7 +8942,67 @@ def _define_discord_view_classes() -> None:
     lazy install sets DISCORD_AVAILABLE=True but leaves the classes
     undefined, causing NameError on the first button interaction.
     """
-    global ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+    global OperatorActionDynamicItem, ExecApprovalView, SlashConfirmView, UpdatePromptView, ModelPickerView, ClarifyChoiceView, ChoicePickerView
+
+    dynamic_item_base = getattr(discord.ui, "DynamicItem", None)
+    if isinstance(dynamic_item_base, type):
+        class OperatorActionDynamicItem(
+            dynamic_item_base,
+            template=(
+                r"^hoa1:(?P<registration_id>[A-Za-z0-9_-]{16}):"
+                r"(?P<action_id>[a-z][a-z0-9_-]{0,63})$"
+            ),
+        ):
+            """One global persistent route for all durable operator buttons."""
+
+            def __init__(
+                self,
+                item: Any,
+                *,
+                registration_id: Optional[str] = None,
+                action_id: Optional[str] = None,
+            ) -> None:
+                super().__init__(item)
+                match = self.template.fullmatch(item.custom_id)
+                if match is None:
+                    raise ValueError("invalid operator action custom_id")
+                self.registration_id = registration_id or match.group(
+                    "registration_id"
+                )
+                self.action_id = action_id or match.group("action_id")
+
+            @classmethod
+            async def from_custom_id(
+                cls,
+                interaction: Any,
+                item: Any,
+                match: Any,
+                /,
+            ) -> Any:
+                return cls(
+                    item,
+                    registration_id=match.group("registration_id"),
+                    action_id=match.group("action_id"),
+                )
+
+            async def callback(self, interaction: Any) -> None:
+                client = getattr(interaction, "client", None)
+                handler = getattr(
+                    client, "_hermes_operator_action_handler", None
+                )
+                if not callable(handler):
+                    await interaction.response.send_message(
+                        "This operator action is unavailable.",
+                        ephemeral=True,
+                    )
+                    return
+                await handler(
+                    interaction,
+                    self.registration_id,
+                    self.action_id,
+                )
+    else:
+        OperatorActionDynamicItem = None
 
     class ExecApprovalView(discord.ui.View):
         """

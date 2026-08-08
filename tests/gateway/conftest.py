@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import re
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -252,6 +253,24 @@ def _ensure_discord_mock() -> None:
             self.sku_id = sku_id
             self.callback = None
 
+    class _FakeDynamicItem:
+        def __init_subclass__(cls, *, template, **kwargs):
+            super().__init_subclass__(**kwargs)
+            cls.__discord_ui_compiled_template__ = re.compile(template)
+
+        def __init__(self, item, *, row=None):
+            self.item = item
+            if row is not None:
+                self.item.row = row
+
+        @property
+        def custom_id(self):
+            return self.item.custom_id
+
+        @property
+        def template(self):
+            return self.__class__.__discord_ui_compiled_template__
+
     class _FakeSelectOption:
         def __init__(self, *, label=None, value=None, description=None, **_):
             self.label = label
@@ -275,6 +294,7 @@ def _ensure_discord_mock() -> None:
         View=_FakeView,
         Select=_FakeSelect,
         Button=_FakeButton,
+        DynamicItem=_FakeDynamicItem,
         button=lambda *a, **k: (lambda fn: fn),
     )
     discord_mod.ButtonStyle = SimpleNamespace(
@@ -551,4 +571,3 @@ def pytest_configure(config):
             raise pytest.UsageError(msg)
         else:
             cache_file.write_text("clean", encoding="utf-8")
-
