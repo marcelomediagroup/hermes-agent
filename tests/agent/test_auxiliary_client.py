@@ -1796,6 +1796,74 @@ class TestAuxiliaryFallbackLayering:
         # Main agent fallback should NOT be needed when chain succeeds
         mock_main.assert_not_called()
 
+    def test_provider_attested_call_does_not_cross_provider_on_capacity_error(
+        self, monkeypatch
+    ):
+        """Provider-locked callers fail instead of silently changing identity."""
+        primary_client = MagicMock()
+        rate_err = Exception("Rate limit exceeded, try again in 60 seconds")
+        rate_err.status_code = 429
+        primary_client.chat.completions.create.side_effect = rate_err
+
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(primary_client, "gpt-5.6-luna"),
+        ), patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "openai-codex",
+                "gpt-5.6-luna",
+                None,
+                None,
+                "codex_responses",
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_chain"
+        ) as mock_chain, patch(
+            "agent.auxiliary_client._try_main_agent_model_fallback"
+        ) as mock_main:
+            with pytest.raises(Exception, match="Rate limit exceeded"):
+                call_llm(
+                    task="routing_classifier",
+                    provider="openai-codex",
+                    model="gpt-5.6-luna",
+                    messages=[{"role": "user", "content": "classify"}],
+                    allow_fallback=False,
+                )
+
+        mock_chain.assert_not_called()
+        mock_main.assert_not_called()
+
+    def test_provider_attested_call_does_not_auto_detect_when_route_unavailable(
+        self,
+    ):
+        with patch(
+            "agent.auxiliary_client._get_cached_client",
+            return_value=(None, None),
+        ) as mock_client, patch(
+            "agent.auxiliary_client._resolve_task_provider_model",
+            return_value=(
+                "openai-codex",
+                "gpt-5.6-luna",
+                None,
+                None,
+                "codex_responses",
+            ),
+        ), patch(
+            "agent.auxiliary_client._try_configured_fallback_for_unavailable_client"
+        ) as mock_chain:
+            with pytest.raises(RuntimeError, match="No LLM provider configured"):
+                call_llm(
+                    task="routing_classifier",
+                    provider="openai-codex",
+                    model="gpt-5.6-luna",
+                    messages=[{"role": "user", "content": "classify"}],
+                    allow_fallback=False,
+                )
+
+        assert mock_client.call_count == 1
+        mock_chain.assert_not_called()
+
 
     def test_warning_emitted_when_all_fallbacks_exhausted(self, monkeypatch, caplog):
         """When chain AND main model both fail, a user-visible warning fires before re-raise."""

@@ -276,6 +276,18 @@ DEFAULT_CONFIG = {
         "reasoning_overrides": {},
     },
 
+    # Opt-in fresh-session complexity router. A platform channel must also
+    # carry ``smart_model_routing: true`` in its channel_model_overrides entry;
+    # enabling this root alone never changes a conversation's model.
+    "smart_model_routing": {
+        "enabled": False,
+        "mode": "fresh_session_complexity",
+        "provider": "openai-codex",
+        "marker_channel_ids": [],
+        "hold_for_session": True,
+        "announce": False,
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",

@@ -1860,7 +1860,6 @@ _EXTRA_KNOWN_ROOT_KEYS = {
     "image_gen",         # image-generation provider config (agent/image_gen_registry.py)
     "video_gen",         # video-generation provider config (agent/video_gen_registry.py)
     "plugins",           # plugin enable/disable lists (hermes_cli/plugins_cmd.py)
-    "smart_model_routing",   # written by the setup wizard (hermes_cli/setup.py)
     "platform_toolsets",     # written by the setup wizard (hermes_cli/setup.py)
     "known_plugin_toolsets", # written/read by hermes_cli/tools_config.py toolset-save flow
     "known_builtin_toolsets",  # ditto — which builtin toolsets a platform's checklist has offered

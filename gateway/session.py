@@ -2796,6 +2796,96 @@ class SessionStore:
             self._save()
             return True
 
+    def get_conversation_metadata(
+        self,
+        session_key: str,
+        key: str,
+        default: Any = None,
+    ) -> Any:
+        """Read metadata that must follow a conversation across ``/resume``.
+
+        The routing index is keyed by the current channel/session key and is
+        replaced by ``switch_session``. Conversation metadata is therefore
+        mirrored into the durable session row's ``model_config`` so resuming a
+        prior transcript restores the same cache-sensitive runtime choices.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return default
+            if key in entry.metadata:
+                return entry.metadata[key]
+            session_id = entry.session_id
+
+        db = getattr(self, "_db", None)
+        if db is None:
+            return default
+        missing = object()
+        try:
+            value = db.get_session_model_config_value(session_id, key, missing)
+        except Exception:
+            logger.debug(
+                "Conversation metadata read failed for %s/%s",
+                session_id,
+                key,
+                exc_info=True,
+            )
+            return default
+        if value is missing:
+            return default
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            current = self._entries.get(session_key)
+            if current is not None and current.session_id == session_id:
+                current.metadata[key] = value
+                self._save()
+        return value
+
+    def set_conversation_metadata(
+        self,
+        session_key: str,
+        key: str,
+        value: Any,
+    ) -> bool:
+        """Persist small non-secret metadata on both route and transcript."""
+        missing = object()
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return False
+            session_id = entry.session_id
+            previous = entry.metadata.get(key, missing)
+            entry.metadata[key] = value
+            entry.updated_at = _now()
+            self._save()
+
+        db = getattr(self, "_db", None)
+        if db is None:
+            return True
+        try:
+            db.patch_session_model_config(session_id, {key: value})
+            return True
+        except Exception:
+            logger.warning(
+                "Conversation metadata persistence failed for %s/%s",
+                session_id,
+                key,
+                exc_info=True,
+            )
+            with self._lock:
+                self._ensure_loaded_locked()
+                current = self._entries.get(session_key)
+                if current is not None and current.session_id == session_id:
+                    if previous is missing:
+                        current.metadata.pop(key, None)
+                    else:
+                        current.metadata[key] = previous
+                    self._save()
+            return False
+
     def set_model_override(
         self, session_key: str, override: Optional[Dict[str, Any]]
     ) -> None:

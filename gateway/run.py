@@ -4559,6 +4559,17 @@ class TurnRunner:
                 session_key=ctx.session_key,
                 user_config=ctx.user_config,
             )
+            model, runtime_kwargs, dynamic_route = (
+                self._runner._resolve_dynamic_channel_route(
+                    message=ctx.message or "",
+                    source=ctx.source,
+                    session_key=ctx.session_key,
+                    is_new_session=ctx.is_new_session,
+                    user_config=ctx.user_config,
+                    model=model,
+                    runtime_kwargs=runtime_kwargs,
+                )
+            )
             logger.debug(
                 "run_agent resolved: model=%s provider=%s session=%s",
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
@@ -4576,6 +4587,18 @@ class TurnRunner:
             source=ctx.source,
             session_key=ctx.session_key,
             model=model,
+            dynamic_reasoning_effort=(
+                dynamic_route.reasoning_effort if dynamic_route is not None else None
+            ),
+        )
+        _dynamic_route_announcement = (
+            dynamic_route.announcement(
+                (ctx.user_config.get("smart_model_routing") or {})
+                if isinstance(ctx.user_config, dict)
+                else {}
+            )
+            if dynamic_route is not None
+            else None
         )
         self._runner._reasoning_config = reasoning_config
         self._runner._service_tier = self._runner._resolve_session_service_tier(
@@ -5501,6 +5524,25 @@ class TurnRunner:
         _approval_session_token = set_current_session_key(_approval_session_key)
         register_gateway_notify(_approval_session_key, _approval_notify_sync)
         try:
+            if _dynamic_route_announcement and ctx._status_adapter is not None:
+                try:
+                    _route_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            _dynamic_route_announcement,
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="dynamic route announcement scheduling error",
+                    )
+                    if _route_fut is not None:
+                        _route_fut.result(timeout=15)
+                except Exception:
+                    logger.debug(
+                        "Dynamic route announcement failed",
+                        exc_info=True,
+                    )
             # If _prepare_inbound_message_text buffered image paths for native
             # attachment, wrap the user turn as an OpenAI-style multimodal
             # content list. Consume-and-clear so subsequent turns on the same
@@ -8320,12 +8362,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         source: Optional[SessionSource] = None,
         session_key: Optional[str] = None,
         model: str = "",
+        dynamic_reasoning_effort: Optional[str] = None,
     ) -> dict | None:
         """Resolve reasoning effort for a session, honoring session overrides.
 
-        Priority: session-scoped ``/reasoning --session`` override >
-        per-model override (``agent.reasoning_overrides``) > global
-        ``agent.reasoning_effort``. ``model`` should be the session's
+        Priority: session-scoped ``/reasoning --session`` override > legacy
+        channel override > fresh-session dynamic route > per-model override
+        (``agent.reasoning_overrides``) > global ``agent.reasoning_effort``.
+        ``model`` should be the session's
         *effective* model (session ``/model`` override included) so
         per-model overrides track what the session actually runs — when
         empty, the config's ``model.default`` is used.
@@ -8347,6 +8391,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if legacy_channel_reasoning is not None:
             return legacy_channel_reasoning
+        if dynamic_reasoning_effort:
+            from hermes_constants import parse_reasoning_effort
+
+            dynamic_reasoning = parse_reasoning_effort(dynamic_reasoning_effort)
+            if dynamic_reasoning is not None:
+                return dynamic_reasoning
         return self._load_reasoning_config(model)
 
     def _set_session_reasoning_override(
@@ -18023,6 +18073,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 source=source,
                 session_id=_run_start_session_id,
                 session_key=session_key,
+                is_new_session=_is_new_session,
                 run_generation=run_generation,
                 event_message_id=self._reply_anchor_for_event(event),
                 channel_prompt=event.channel_prompt,
@@ -23434,6 +23485,138 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return model, updated_runtime
 
+    def _resolve_dynamic_channel_route(
+        self,
+        *,
+        message: str,
+        source: Optional[SessionSource],
+        session_key: Optional[str],
+        is_new_session: bool,
+        user_config: dict,
+        model: str,
+        runtime_kwargs: dict,
+    ):
+        """Resolve one fixed model route for an opted-in fresh session.
+
+        The legacy channel entry is the authoritative opt-in.  The optional
+        root ``marker_channel_ids`` list is a second guard for deployments
+        that want both declarations to match.  Once chosen, only the
+        non-secret tier/provider/model identity is persisted on the stable
+        SessionEntry; later turns reuse it without another classifier call.
+        """
+        from agent.model_router import (
+            decision_for_tier,
+            decision_from_metadata,
+            route_request,
+        )
+
+        unchanged = (model, runtime_kwargs, None)
+        if not isinstance(user_config, dict) or source is None or not session_key:
+            return unchanged
+
+        routing_cfg = user_config.get("smart_model_routing") or {}
+        if not isinstance(routing_cfg, dict):
+            return unchanged
+        if not is_truthy_value(routing_cfg.get("enabled"), default=False):
+            return unchanged
+        if (
+            str(routing_cfg.get("mode") or "fresh_session_complexity")
+            != "fresh_session_complexity"
+        ):
+            return unchanged
+        if str(routing_cfg.get("provider") or "openai-codex") != "openai-codex":
+            return unchanged
+        if not is_truthy_value(routing_cfg.get("hold_for_session"), default=True):
+            return unchanged
+
+        channel_entry = self._channel_scoped_config_entry(
+            user_config, source, "channel_model_overrides"
+        )
+        if not isinstance(channel_entry, dict):
+            return unchanged
+        if not is_truthy_value(
+            channel_entry.get("smart_model_routing"), default=False
+        ):
+            return unchanged
+        if str(channel_entry.get("provider") or "") != "openai-codex":
+            return unchanged
+
+        marker_ids = routing_cfg.get("marker_channel_ids")
+        if isinstance(marker_ids, (list, tuple, set)) and marker_ids:
+            configured_ids = {
+                str(value).strip()
+                for value in marker_ids
+                if str(value).strip()
+            }
+            source_ids = {
+                str(value).strip()
+                for value in (
+                    getattr(source, "chat_id", None),
+                    getattr(source, "thread_id", None),
+                    getattr(source, "parent_chat_id", None),
+                )
+                if str(value or "").strip()
+            }
+            if not configured_ids.intersection(source_ids):
+                return unchanged
+
+        actual_provider = str(
+            runtime_kwargs.get("provider")
+            or runtime_kwargs.get("requested_provider")
+            or ""
+        )
+        if actual_provider != "openai-codex":
+            return unchanged
+
+        state = self._peek_session_state(session_key)
+        if state is not None and state.conversation.model_override is not None:
+            return unchanged
+
+        store = getattr(self, "session_store", None)
+        persisted = None
+        if store is not None:
+            try:
+                persisted = store.get_conversation_metadata(
+                    session_key, "smart_model_route"
+                )
+            except Exception:
+                logger.debug(
+                    "Dynamic route metadata read failed for %s",
+                    session_key,
+                    exc_info=True,
+                )
+        decision = decision_from_metadata(persisted)
+        if decision is None:
+            if store is None:
+                # Without durable session storage, a non-default decision
+                # would silently change on the next turn. Stay on Terra.
+                decision = decision_for_tier("standard")
+            elif is_new_session:
+                decision = route_request(message)
+            else:
+                # A pre-existing session that predates routing must not be
+                # classified mid-conversation. Pin the safe default instead.
+                decision = decision_for_tier("standard")
+            if store is not None:
+                try:
+                    persisted_ok = store.set_conversation_metadata(
+                        session_key,
+                        "smart_model_route",
+                        decision.to_metadata(),
+                    )
+                    if not persisted_ok:
+                        raise RuntimeError("session entry is unavailable")
+                except Exception:
+                    logger.warning(
+                        "Dynamic route metadata persistence failed for %s; "
+                        "continuing with Terra for this turn",
+                        session_key,
+                        exc_info=True,
+                    )
+                    decision = decision_for_tier("standard")
+
+        return decision.model, runtime_kwargs, decision
+
     def _resolve_channel_reasoning_config(
         self,
         user_config: dict,
@@ -24992,6 +25175,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        is_new_session: bool = False,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -25005,7 +25189,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not getattr(getattr(self, "config", None), "multiplex_profiles", False):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
+                session_key=session_key, is_new_session=is_new_session,
+                run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
@@ -25017,7 +25202,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         with _profile_runtime_scope(profile_home):
             return await self._run_agent_inner(
                 message, context_prompt, history, source, session_id,
-                session_key=session_key, run_generation=run_generation,
+                session_key=session_key, is_new_session=is_new_session,
+                run_generation=run_generation,
                 _interrupt_depth=_interrupt_depth, event_message_id=event_message_id,
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
@@ -25145,6 +25331,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        is_new_session: bool = False,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -25423,6 +25610,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             channel_prompt=channel_prompt,
             session_id=session_id,
             session_key=session_key,
+            is_new_session=is_new_session,
             run_generation=run_generation,
             _interrupt_depth=_interrupt_depth,
             event_message_id=event_message_id,

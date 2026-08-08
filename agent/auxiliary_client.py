@@ -8754,6 +8754,7 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    allow_fallback: bool = True,
 ) -> Any:
     """Run an auxiliary LLM request, applying the configured task limit."""
     semaphore = _acquire_sync_aux_semaphore(task)
@@ -8778,6 +8779,7 @@ def call_llm(
             api_mode=api_mode,
             stream=stream,
             stream_options=stream_options,
+            allow_fallback=allow_fallback,
         )
         if stream and semaphore is not None:
             stream_semaphore = semaphore
@@ -8823,6 +8825,7 @@ def _call_llm_impl(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    allow_fallback: bool = True,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -8854,6 +8857,9 @@ def _call_llm_impl(
             output can stream to the user.
         stream_options: Passed through to the request when stream is True
             (e.g. {"include_usage": True}).
+        allow_fallback: Whether request-time capacity/auth failures may route to
+            another provider. Set false for provider-attested callers that must
+            fail closed instead of silently changing route identity.
 
     Returns:
         Response object with .choices[0].message.content, OR — when stream=True —
@@ -8921,7 +8927,11 @@ def _call_llm_impl(
             # tasks because fallback entries may use OAuth / credential-pool
             # auth (for example openai-codex).
             _explicit = (resolved_provider or "").strip().lower()
-            if _explicit and _explicit not in {"auto", "openrouter", "custom"}:
+            if (
+                allow_fallback
+                and _explicit
+                and _explicit not in {"auto", "openrouter", "custom"}
+            ):
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
                     task, _explicit,
                 )
@@ -8940,7 +8950,7 @@ def _call_llm_impl(
             # Pass model=None so each provider uses its own default —
             # resolved_model may be an OpenRouter-format slug that doesn't
             # work on other providers.
-            if client is None and not resolved_base_url:
+            if allow_fallback and client is None and not resolved_base_url:
                 logger.info("Auxiliary %s: provider %s unavailable, trying auto-detection chain",
                             task or "call", resolved_provider)
                 client, final_model = _get_cached_client(
@@ -9422,7 +9432,7 @@ def _call_llm_impl(
             or _is_model_incompatible_error(first_err)
             or _is_invalid_aux_response_error(first_err)
         )
-        if should_fallback and (is_auto or is_capacity_error):
+        if allow_fallback and should_fallback and (is_auto or is_capacity_error):
             if _is_auth_error(first_err):
                 reason = "auth error"
             elif _is_payment_error(first_err):
