@@ -18,6 +18,25 @@ from plugins.platforms.discord.adapter import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_discord_gate_environment(monkeypatch):
+    """Keep auth routing tests independent of the operator's live profile."""
+    for name in (
+        "DISCORD_ALLOWED_USERS",
+        "DISCORD_ALLOWED_ROLES",
+        "DISCORD_ALLOWED_CHANNELS",
+        "DISCORD_IGNORED_CHANNELS",
+        "DISCORD_NO_THREAD_CHANNELS",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+        "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
+        "DISCORD_ALLOW_ALL_USERS",
+        "DISCORD_ALLOW_BOTS",
+        "GATEWAY_ALLOW_ALL_USERS",
+        "GATEWAY_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
 def _card_payload(**overrides):
     payload = {
         "kind": "operator_card",
