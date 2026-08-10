@@ -252,8 +252,12 @@ _DISCORD_OPERATOR_CARD_SEVERITY_LABELS = {
 _DISCORD_OPERATOR_ACTION_TTL_SECONDS = 7 * 24 * 60 * 60
 
 
-def _build_operator_card_embed(card: OperatorCard) -> Any:
-    """Render a validated operator card as a bounded Discord embed."""
+def build_operator_card_embed(card: OperatorCard) -> Any:
+    """Render a validated operator card as a bounded Discord embed.
+
+    This public seam lets trusted out-of-process producers reuse the exact
+    Discord presentation contract after validating an ``OperatorCard``.
+    """
     embed = discord.Embed(
         title=card.title,
         description=card.summary,
@@ -3297,7 +3301,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     operator_card,
                     max_length=self.MAX_MESSAGE_LENGTH,
                 )
-                operator_card_embed = _build_operator_card_embed(operator_card)
+                operator_card_embed = build_operator_card_embed(operator_card)
                 severity_label = _DISCORD_OPERATOR_CARD_SEVERITY_LABELS[
                     operator_card.severity
                 ]
@@ -5388,7 +5392,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     outcome.card,
                     max_length=self.MAX_MESSAGE_LENGTH,
                 ),
-                embed=_build_operator_card_embed(outcome.card),
+                embed=build_operator_card_embed(outcome.card),
                 view=None,
             )
         except Exception as exc:
