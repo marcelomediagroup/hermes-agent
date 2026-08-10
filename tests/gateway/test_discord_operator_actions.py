@@ -8,6 +8,7 @@ import discord
 import pytest
 
 from gateway.config import PlatformConfig
+from gateway.intake_cards import build_attachment_intake_card
 from gateway.operator_actions import OperatorActionDispatcher
 from gateway.operator_actions import OperatorActionPersistenceError
 from gateway.operator_cards import OperatorCard
@@ -326,6 +327,67 @@ async def test_normal_operator_card_send_includes_durable_view(tmp_path, monkeyp
     button = _button(kwargs["view"].children[0])
     assert button.custom_id.startswith("hoa1:")
     assert button.custom_id.endswith(":accept")
+
+
+@pytest.mark.asyncio
+async def test_intake_issue_action_is_authenticated_durable_intent_only(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    adapter._allowed_user_ids = {"111"}
+
+    class _NoExternalRunner:
+        def __getattribute__(self, name):
+            raise AssertionError(f"external gateway access is forbidden: {name}")
+
+    adapter.gateway_runner = _NoExternalRunner()
+    channel = SimpleNamespace(
+        send=AsyncMock(return_value=SimpleNamespace(id=7004)),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _channel_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+    card = build_attachment_intake_card(
+        filename="agreement.pdf",
+        mime_type="application/pdf",
+        status="ready",
+        source_ref="message-1:attachment-1",
+        size_bytes=2048,
+        limit_bytes=1024 * 1024,
+    )
+
+    result = await adapter.send(
+        "555",
+        "fallback",
+        metadata={"operator_card": card.to_mapping()},
+    )
+
+    assert result.success is True
+    view = channel.send.await_args.kwargs["view"]
+    issue_button = next(
+        _button(child)
+        for child in view.children
+        if _button(child).custom_id.endswith(":create_oe_task")
+    )
+    _, registration_id, action_id = issue_button.custom_id.split(":", 2)
+    interaction = _interaction("111")
+
+    await adapter._handle_operator_action_interaction(
+        interaction,
+        registration_id,
+        action_id,
+    )
+
+    interaction.response.defer.assert_awaited_once_with()
+    interaction.edit_original_response.assert_awaited_once()
+    records = adapter._operator_actions.read_audit_records()
+    assert [(record["action_id"], record["result"]) for record in records] == [
+        ("create_oe_task", "recorded")
+    ]
+    assert not list(tmp_path.rglob("*linear*"))
 
 
 @pytest.mark.asyncio

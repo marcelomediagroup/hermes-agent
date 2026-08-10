@@ -836,6 +836,10 @@ def _resolve_cache_dir(constant_name: str, new_subpath: str, old_name: str) -> P
 DEFAULT_INBOUND_MEDIA_MAX_BYTES = 128 * 1024 * 1024
 
 
+class InboundMediaTooLargeError(ValueError):
+    """An inbound media payload exceeded its configured byte limit."""
+
+
 def get_inbound_media_max_bytes() -> int:
     """Return the max inbound image/audio/video bytes allowed in memory.
 
@@ -871,7 +875,7 @@ def validate_inbound_media_size(
     """
     limit = get_inbound_media_max_bytes() if max_bytes is None else max_bytes
     if limit and size > limit:
-        raise ValueError(
+        raise InboundMediaTooLargeError(
             f"Inbound {media_type} payload is too large "
             f"({size} bytes > {limit} bytes)"
         )
@@ -2809,25 +2813,57 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
-def _merge_pending_intake_cards(existing: MessageEvent, incoming: MessageEvent) -> None:
-    """Preserve ordered intake-card deliveries when media events coalesce."""
+def _merge_pending_media_metadata(
+    existing: MessageEvent,
+    incoming: MessageEvent,
+    *,
+    media_index_offset: int,
+) -> None:
+    """Preserve ordered intake/STT metadata when media events coalesce."""
     incoming_metadata = getattr(incoming, "metadata", None)
     incoming_cards = (
         incoming_metadata.get("intake_cards")
         if isinstance(incoming_metadata, dict)
         else None
     )
-    if not isinstance(incoming_cards, list) or not incoming_cards:
-        return
     existing_metadata = getattr(existing, "metadata", None)
     if not isinstance(existing_metadata, dict):
         existing_metadata = {}
         existing.metadata = existing_metadata
-    existing_cards = existing_metadata.setdefault("intake_cards", [])
-    if not isinstance(existing_cards, list):
-        existing_cards = []
-        existing_metadata["intake_cards"] = existing_cards
-    existing_cards.extend(incoming_cards)
+    if isinstance(incoming_cards, list) and incoming_cards:
+        existing_cards = existing_metadata.setdefault("intake_cards", [])
+        if not isinstance(existing_cards, list):
+            existing_cards = []
+            existing_metadata["intake_cards"] = existing_cards
+        existing_cards.extend(incoming_cards)
+
+    incoming_voice_refs = (
+        incoming_metadata.get("voice_intake_source_refs")
+        if isinstance(incoming_metadata, dict)
+        else None
+    )
+    if isinstance(incoming_voice_refs, list) and incoming_voice_refs:
+        existing_refs = existing_metadata.setdefault("voice_intake_source_refs", [])
+        if not isinstance(existing_refs, list):
+            existing_refs = []
+            existing_metadata["voice_intake_source_refs"] = existing_refs
+        existing_refs.extend(
+            str(ref) if isinstance(ref, (str, int)) and str(ref) else None
+            for ref in incoming_voice_refs
+        )
+
+    if isinstance(incoming_metadata, dict) and "stt_media_indexes" in incoming_metadata:
+        incoming_indexes = incoming_metadata.get("stt_media_indexes")
+        if isinstance(incoming_indexes, list):
+            existing_indexes = existing_metadata.setdefault("stt_media_indexes", [])
+            if not isinstance(existing_indexes, list):
+                existing_indexes = []
+                existing_metadata["stt_media_indexes"] = existing_indexes
+            existing_indexes.extend(
+                media_index_offset + int(index)
+                for index in incoming_indexes
+                if isinstance(index, int) and index >= 0
+            )
 
 
 def merge_pending_message_event(
@@ -2856,15 +2892,21 @@ def merge_pending_message_event(
         incoming_has_media = bool(event.media_urls)
 
         if existing_is_photo and incoming_is_photo:
+            media_index_offset = len(existing.media_urls)
             existing.media_urls.extend(event.media_urls)
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
-            _merge_pending_intake_cards(existing, event)
+            _merge_pending_media_metadata(
+                existing,
+                event,
+                media_index_offset=media_index_offset,
+            )
             _invalidate_pending_stt_cache(existing)
             return
 
         if existing_has_media or incoming_has_media:
+            media_index_offset = len(existing.media_urls)
             if incoming_has_media:
                 existing.media_urls.extend(event.media_urls)
                 existing.media_types.extend(event.media_types)
@@ -2880,7 +2922,11 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
-            _merge_pending_intake_cards(existing, event)
+            _merge_pending_media_metadata(
+                existing,
+                event,
+                media_index_offset=media_index_offset,
+            )
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2891,7 +2937,11 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
-            _merge_pending_intake_cards(existing, event)
+            _merge_pending_media_metadata(
+                existing,
+                event,
+                media_index_offset=len(existing.media_urls),
+            )
             return
 
     pending_messages[session_key] = event

@@ -3129,6 +3129,10 @@ def _event_media_is_audio(event, index: int) -> bool:
 
 def _event_media_is_stt_input(event, index: int) -> bool:
     """True when an audio attachment should enter the automatic STT pipeline."""
+    metadata = getattr(event, "metadata", None)
+    if isinstance(metadata, dict) and "stt_media_indexes" in metadata:
+        indexes = metadata.get("stt_media_indexes")
+        return isinstance(indexes, list) and index in indexes
     message_type = getattr(event, "message_type", None)
     if message_type in {MessageType.AUDIO, MessageType.DOCUMENT}:
         return False
@@ -18428,10 +18432,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
 
-        # Discord's adapter attaches content-free intake card mappings to the
-        # normalized event. Deliver them through the existing authenticated
+        # A platform adapter may attach validated intake-card mappings to the
+        # normalized event. Deliver them through that adapter's existing
         # operator-card path before the agent turn, at most once per event.
-        await self._send_pending_intake_cards_once(
+        await self._send_pending_operator_cards_once(
             event,
             self._adapter_for_source(source),
             source,
@@ -18568,20 +18572,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _successful_transcripts,
                     metadata=_echo_meta,
                 )
-                self._queue_discord_voice_intake_cards(
-                    event,
-                    source,
-                    transcripts=[],
-                    blocked_count=max(
-                        0,
-                        len(audio_paths) - len(_successful_transcripts),
-                    ),
-                    ordinal_offset=len(_successful_transcripts),
-                )
-                await self._send_pending_intake_cards_once(
+                await self._finalize_voice_intake_cards(
                     event,
                     _echo_adapter,
                     source,
+                    transcripts=_successful_transcripts,
+                    audio_count=len(audio_paths),
                     metadata=_echo_meta,
                 )
                 # NOTE: Previously, when transcription failed (e.g. no STT
@@ -24961,7 +24957,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         enriched_parts = []
         for path in image_paths:
             try:
-                logger.debug("Auto-analyzing user image: %s", path)
+                logger.debug("Auto-analyzing one private user image")
                 result_json = await vision_analyze_tool(
                     image_url=path,
                     user_prompt=analysis_prompt,
@@ -24982,7 +24978,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"with vision_analyze using image_url: {path}]"
                     )
             except Exception as e:
-                logger.error("Vision auto-analysis error: %s", e)
+                logger.error(
+                    "Vision auto-analysis error (%s)",
+                    type(e).__name__,
+                )
                 enriched_parts.append(
                     f"[The user sent an image but something went wrong when I "
                     f"tried to look at it~ You can try examining it yourself "
@@ -25061,7 +25060,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         successful_transcripts: List[str] = []
         for path in audio_paths:
             try:
-                logger.debug("Transcribing user voice: %s", path)
+                logger.debug("Transcribing one private user voice attachment")
                 result = await asyncio.to_thread(
                     transcribe_audio, path, None, "gateway",
                 )
@@ -25071,10 +25070,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         path,
                     )
                     if fallback.get("success"):
-                        logger.info(
-                            "Configured STT failed for %s; recovered with local STT",
-                            path,
-                        )
+                        logger.info("Configured STT failed; recovered with local STT")
                         result = fallback
                 if result["success"]:
                     transcript = result["transcript"]
@@ -25099,7 +25095,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # reply to the content.
                     enriched_parts.append(f'"{transcript}"')
                 else:
-                    error = result.get("error", "unknown error")
                     # All failure branches: a single, minimal, neutral marker.
                     # Do NOT mention "no STT provider configured", "setup
                     # instructions", or the "hermes-agent-setup" skill, and do
@@ -25109,7 +25104,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # even after transcription starts working. The cause is
                     # logged for operator diagnosis but kept out of the
                     # LLM-visible prompt.
-                    logger.info("Voice transcription failed for %s: %s", path, error)
+                    logger.info("Voice transcription failed for one attachment")
                     from tools.credential_files import to_agent_visible_cache_path
 
                     agent_path = to_agent_visible_cache_path(os.path.abspath(path))
@@ -25118,7 +25113,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         f"the audio is available at: {agent_path}]"
                     )
             except Exception as e:
-                logger.error("Transcription error: %s", e)
+                logger.error("Transcription error (%s)", type(e).__name__)
                 from tools.credential_files import to_agent_visible_cache_path
 
                 agent_path = to_agent_visible_cache_path(os.path.abspath(path))
@@ -25179,22 +25174,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return enriched_text, successful_transcripts
 
     @staticmethod
-    def _queue_discord_voice_intake_cards(
+    def _queue_voice_intake_cards(
         event,
         source,
         *,
         transcripts: List[str],
         blocked_count: int = 0,
-        ordinal_offset: int = 0,
     ) -> None:
         """Attach deterministic, content-bounded voice cards to an event."""
-        if getattr(source, "platform", None) != Platform.DISCORD:
-            return
-
         metadata = getattr(event, "metadata", None)
         if not isinstance(metadata, dict):
-            metadata = {}
-            event.metadata = metadata
+            return
+        source_refs = metadata.get("voice_intake_source_refs")
+        if not isinstance(source_refs, list) or not source_refs:
+            return
         raw_cards = metadata.setdefault("intake_cards", [])
         if not isinstance(raw_cards, list):
             raw_cards = []
@@ -25205,33 +25198,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             for raw in raw_cards
             if isinstance(raw, dict) and raw.get("state_ref")
         }
-        source_ref = str(
+        fallback_source_ref = str(
             getattr(event, "message_id", None)
             or getattr(source, "message_id", None)
-            or f"{getattr(source, 'chat_id', 'discord')}:{getattr(source, 'user_id', '')}"
+            or f"{getattr(source, 'chat_id', 'gateway')}:{getattr(source, 'user_id', '')}"
         )
 
-        new_cards = [
-            build_voice_note_intake_card(
-                transcript,
-                source_ref=source_ref,
-                ordinal=ordinal_offset + index,
+        new_cards = []
+        for index, transcript in enumerate(transcripts):
+            source_ref = (
+                source_refs[index] if index < len(source_refs) else fallback_source_ref
             )
-            for index, transcript in enumerate(transcripts)
-        ]
-        new_cards.extend(
-            build_voice_note_blocked_card(
-                source_ref=source_ref,
-                ordinal=ordinal_offset + len(transcripts) + index,
+            if source_ref:
+                new_cards.append(
+                    build_voice_note_intake_card(
+                        transcript,
+                        source_ref=str(source_ref),
+                        ordinal=index,
+                    )
+                )
+        for blocked_index in range(max(0, int(blocked_count))):
+            ordinal = len(transcripts) + blocked_index
+            source_ref = (
+                source_refs[ordinal]
+                if ordinal < len(source_refs)
+                else fallback_source_ref
             )
-            for index in range(max(0, int(blocked_count)))
-        )
+            if source_ref:
+                new_cards.append(
+                    build_voice_note_blocked_card(
+                        source_ref=str(source_ref),
+                        ordinal=ordinal,
+                    )
+                )
         for card in new_cards:
             if card.state_ref not in existing_refs:
                 raw_cards.append(card.to_mapping())
                 existing_refs.add(card.state_ref)
 
-    async def _send_pending_intake_cards_once(
+    async def _send_pending_operator_cards_once(
         self,
         event,
         adapter,
@@ -25239,8 +25244,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         *,
         metadata=None,
     ) -> None:
-        """Send Discord intake cards via its authenticated action dispatcher."""
-        if getattr(source, "platform", None) != Platform.DISCORD or adapter is None:
+        """Send normalized pending operator cards through the owning adapter."""
+        if adapter is None:
             return
         event_metadata = getattr(event, "metadata", None)
         if not isinstance(event_metadata, dict):
@@ -25258,7 +25263,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 card = OperatorCard.from_mapping(raw_card)
             except Exception as exc:
                 logger.warning(
-                    "Discord intake card validation failed (%s)",
+                    "Operator intake card validation failed (%s)",
                     type(exc).__name__,
                 )
                 sent_count += 1
@@ -25284,15 +25289,39 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             except Exception as exc:
                 logger.warning(
-                    "Discord intake card send failed (%s)",
+                    "Operator intake card send failed (%s)",
                     type(exc).__name__,
                 )
                 break
             if getattr(result, "success", True) is False:
-                logger.warning("Discord intake card send returned failure")
+                logger.warning("Operator intake card send returned failure")
                 break
             sent_count += 1
             setattr(event, "_gateway_intake_cards_sent", sent_count)
+
+    async def _finalize_voice_intake_cards(
+        self,
+        event,
+        adapter,
+        source,
+        *,
+        transcripts: List[str],
+        audio_count: int,
+        metadata=None,
+    ) -> None:
+        """Build ready/blocked voice cards and deliver the new tail once."""
+        self._queue_voice_intake_cards(
+            event,
+            source,
+            transcripts=transcripts,
+            blocked_count=max(0, audio_count - len(transcripts)),
+        )
+        await self._send_pending_operator_cards_once(
+            event,
+            adapter,
+            source,
+            metadata=metadata,
+        )
 
     async def _echo_pending_stt_transcripts_once(
         self,
@@ -25316,11 +25345,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         values because two separate notes that transcribe identically are two
         distinct deliveries and both must be echoed.
         """
-        self._queue_discord_voice_intake_cards(
-            event,
-            source,
-            transcripts=transcripts,
-        )
         if transcripts and self._should_echo_stt_transcripts() and adapter is not None:
             already_echoed = int(
                 getattr(event, "_gateway_pending_stt_echoed", 0) or 0
@@ -25340,12 +25364,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         log_context,
                         type(echo_exc).__name__,
                     )
-        await self._send_pending_intake_cards_once(
-            event,
-            adapter,
-            source,
-            metadata=metadata,
-        )
 
     async def _transcribe_and_echo_pending_voice(
         self,
@@ -25388,17 +25406,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=echo_meta,
                 log_context=log_context,
             )
-            self._queue_discord_voice_intake_cards(
-                event,
-                source,
-                transcripts=[],
-                blocked_count=max(0, len(audio_paths) - len(transcripts)),
-                ordinal_offset=len(transcripts),
-            )
-            await self._send_pending_intake_cards_once(
+            await self._finalize_voice_intake_cards(
                 event,
                 adapter,
                 source,
+                transcripts=transcripts,
+                audio_count=len(audio_paths),
                 metadata=echo_meta,
             )
             return enriched_text or text, transcripts
@@ -25408,16 +25421,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 log_context,
                 type(trans_exc).__name__,
             )
-            self._queue_discord_voice_intake_cards(
-                event,
-                source,
-                transcripts=[],
-                blocked_count=len(audio_paths),
-            )
-            await self._send_pending_intake_cards_once(
+            await self._finalize_voice_intake_cards(
                 event,
                 adapter,
                 source,
+                transcripts=[],
+                audio_count=len(audio_paths),
                 metadata=(
                     self._thread_metadata_for_source(
                         source,

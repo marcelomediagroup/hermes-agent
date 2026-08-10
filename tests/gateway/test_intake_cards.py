@@ -210,6 +210,10 @@ def _discord_voice_event() -> tuple[MessageEvent, SessionSource]:
         message_id="message-voice-1",
         media_urls=["/private/cache/voice.ogg"],
         media_types=["audio/ogg"],
+        metadata={
+            "stt_media_indexes": [0],
+            "voice_intake_source_refs": ["message-voice-1:attachment-1"],
+        },
     ), source
 
 
@@ -245,7 +249,8 @@ async def test_discord_voice_success_echoes_transcript_and_sends_action_card_onc
 
 
 @pytest.mark.asyncio
-async def test_discord_voice_failure_sends_blocked_card_without_actions():
+async def test_discord_voice_failure_sends_blocked_card_without_actions(caplog):
+    caplog.set_level("INFO")
     adapter = SimpleNamespace(
         send=AsyncMock(return_value=SendResult(success=True, message_id="sent"))
     )
@@ -254,7 +259,7 @@ async def test_discord_voice_failure_sends_blocked_card_without_actions():
 
     with patch(
         "tools.transcription_tools.transcribe_audio",
-        return_value={"success": False, "error": "provider unavailable"},
+        return_value={"success": False, "error": "private provider payload"},
     ):
         await runner._prepare_inbound_message_text(
             event=event,
@@ -268,6 +273,8 @@ async def test_discord_voice_failure_sends_blocked_card_without_actions():
     )
     assert card.title == "Voice note blocked"
     assert card.actions == ()
+    assert "private provider payload" not in caplog.text
+    assert "/private/cache/voice.ogg" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -307,3 +314,36 @@ async def test_discord_attachment_card_uses_authenticated_delivery_once():
     assert card.title == "Attachment ready"
     assert metadata["requester_user_id"] == "authorized-user"
     assert metadata["non_conversational"] is True
+
+
+@pytest.mark.asyncio
+async def test_document_first_mixed_media_still_transcribes_native_voice():
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="sent"))
+    )
+    runner = _discord_voice_runner(adapter)
+    event, source = _discord_voice_event()
+    event.message_type = MessageType.DOCUMENT
+    event.media_urls = [
+        "/private/cache/agreement.pdf",
+        "/private/cache/voice.ogg",
+    ]
+    event.media_types = ["application/pdf", "audio/ogg"]
+    event.metadata["stt_media_indexes"] = [1]
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        return_value={"success": True, "transcript": "voice after pdf", "provider": "mock"},
+    ) as transcribe:
+        result = await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    transcribe.assert_called_once_with("/private/cache/voice.ogg")
+    assert "voice after pdf" in result
+    card = OperatorCard.from_mapping(
+        adapter.send.await_args_list[-1].kwargs["metadata"]["operator_card"]
+    )
+    assert card.title == "Voice note ready"
