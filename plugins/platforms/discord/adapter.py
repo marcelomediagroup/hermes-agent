@@ -147,6 +147,7 @@ from gateway.operator_actions import (
     OperatorActionRegistration,
 )
 from gateway.operator_cards import OperatorCard, render_operator_card_text
+from gateway.intake_cards import build_attachment_intake_card
 
 from gateway.platforms.helpers import (
     MessageDeduplicator,
@@ -156,6 +157,7 @@ from gateway.platforms.helpers import (
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    InboundMediaTooLargeError,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -168,6 +170,7 @@ from gateway.platforms.base import (
     SUPPORTED_DOCUMENT_TYPES,
     _TEXT_INJECT_EXTENSIONS,
     _prefix_within_utf16_limit,
+    get_inbound_media_max_bytes,
     utf16_len,
     validate_inbound_media_size,
 )
@@ -5008,7 +5011,11 @@ class DiscordAdapter(BasePlatformAdapter):
             if not transcript or is_whisper_hallucination(transcript):
                 return
 
-            logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+            logger.info(
+                "Voice input transcribed for user %d (%d characters)",
+                user_id,
+                len(transcript),
+            )
 
             if self._voice_input_callback:
                 await self._voice_input_callback(
@@ -8135,9 +8142,8 @@ class DiscordAdapter(BasePlatformAdapter):
             raw_bytes = await reader()
         except Exception as e:
             logger.warning(
-                "[Discord] Authenticated attachment read failed for %s: %s",
-                getattr(att, "filename", None) or getattr(att, "url", "<unknown>"),
-                e,
+                "[Discord] Authenticated attachment read failed (%s)",
+                type(e).__name__,
             )
             return None
         validate_inbound_media_size(len(raw_bytes), media_type=media_type)
@@ -8378,7 +8384,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if resolved_reference is not None:
             referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
 
-        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
+        direct_attachments = list(message.attachments) + snapshot_attachments
+        all_attachments = direct_attachments + referenced_attachments
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -8456,10 +8463,48 @@ class DiscordAdapter(BasePlatformAdapter):
         # vision tool can access them reliably (Discord CDN URLs can expire).
         media_urls = []
         media_types = []
+        intake_cards = []
+        stt_media_indexes = []
+        voice_intake_source_refs = []
         pending_text_injection: Optional[str] = None
-        for att in all_attachments:
+        for attachment_index, att in enumerate(all_attachments):
+            is_direct_attachment = attachment_index < len(direct_attachments)
             content_type = att.content_type or "unknown"
+            filename = getattr(att, "filename", None) or "attachment"
+            declared_size = getattr(att, "size", None)
+            attachment_id = getattr(att, "id", None)
+            if not isinstance(attachment_id, (str, int)):
+                attachment_id = attachment_index
+            source_ref = f"{message.id}:{attachment_id}:{attachment_index}"
+            global_media_limit = get_inbound_media_max_bytes()
+
+            def _effective_limit(*limits: int) -> int:
+                positive = [int(limit) for limit in limits if int(limit or 0) > 0]
+                return min(positive) if positive else 0
+
+            def _attachment_card(status: str, *, limit_bytes: int = 0) -> None:
+                if not is_direct_attachment:
+                    return
+                intake_cards.append(
+                    build_attachment_intake_card(
+                        filename=filename,
+                        mime_type=(
+                            content_type
+                            if content_type and content_type != "unknown"
+                            else "application/octet-stream"
+                        ),
+                        status=status,
+                        source_ref=source_ref,
+                        size_bytes=declared_size,
+                        limit_bytes=limit_bytes or None,
+                    ).to_mapping()
+                )
+
             if content_type.startswith("image/"):
+                media_limit = _effective_limit(global_media_limit)
+                if media_limit and declared_size and declared_size > media_limit:
+                    _attachment_card("oversized", limit_bytes=media_limit)
+                    continue
                 try:
                     # Determine extension from content type (image/png -> .png)
                     ext = "." + content_type.split("/")[-1].split(";")[0]
@@ -8468,25 +8513,52 @@ class DiscordAdapter(BasePlatformAdapter):
                     cached_path = await self._cache_discord_image(att, ext)
                     media_urls.append(cached_path)
                     media_types.append(content_type)
-                    print(f"[Discord] Cached user image: {cached_path}", flush=True)
+                    _attachment_card("ready", limit_bytes=media_limit)
+                    logger.info("[Discord] Cached one user image privately")
                 except Exception as e:
-                    print(f"[Discord] Failed to cache image attachment: {e}", flush=True)
-                    # Fall back to the CDN URL if caching fails
-                    media_urls.append(att.url)
-                    media_types.append(content_type)
+                    status = (
+                        "oversized"
+                        if isinstance(e, InboundMediaTooLargeError)
+                        else "download_failed"
+                    )
+                    _attachment_card(status, limit_bytes=media_limit)
+                    logger.warning(
+                        "[Discord] Failed to cache image attachment (%s)",
+                        type(e).__name__,
+                    )
             elif content_type.startswith("audio/"):
+                is_native_voice_note = self._is_discord_voice_message_attachment(att)
+                media_limit = _effective_limit(global_media_limit)
+                if media_limit and declared_size and declared_size > media_limit:
+                    _attachment_card("oversized", limit_bytes=media_limit)
+                    continue
                 try:
                     ext = "." + content_type.split("/")[-1].split(";")[0]
                     if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
                         ext = ".ogg"
                     cached_path = await self._cache_discord_audio(att, ext)
+                    media_index = len(media_urls)
                     media_urls.append(cached_path)
                     media_types.append(content_type)
-                    print(f"[Discord] Cached user audio: {cached_path}", flush=True)
+                    if is_native_voice_note:
+                        stt_media_indexes.append(media_index)
+                        voice_intake_source_refs.append(
+                            source_ref if is_direct_attachment else None
+                        )
+                    if not is_native_voice_note:
+                        _attachment_card("ready", limit_bytes=media_limit)
+                    logger.info("[Discord] Cached one user audio attachment privately")
                 except Exception as e:
-                    print(f"[Discord] Failed to cache audio attachment: {e}", flush=True)
-                    media_urls.append(att.url)
-                    media_types.append(content_type)
+                    status = (
+                        "oversized"
+                        if isinstance(e, InboundMediaTooLargeError)
+                        else "download_failed"
+                    )
+                    _attachment_card(status, limit_bytes=media_limit)
+                    logger.warning(
+                        "[Discord] Failed to cache audio attachment (%s)",
+                        type(e).__name__,
+                    )
             else:
                 # Document attachments: download, cache, and optionally inject text
                 ext = ""
@@ -8501,15 +8573,38 @@ class DiscordAdapter(BasePlatformAdapter):
                 # is the gate, not the file extension. Known types keep their
                 # precise MIME; unknown types fall back to the source content_type
                 # or octet-stream so the agent reaches for terminal tools.
-                max_doc_bytes = self._discord_max_attachment_bytes()
-                if max_doc_bytes and att.size and att.size > max_doc_bytes:
+                max_doc_bytes = _effective_limit(
+                    self._discord_max_attachment_bytes(),
+                    global_media_limit,
+                )
+                if max_doc_bytes and declared_size and declared_size > max_doc_bytes:
                     logger.warning(
-                        "[Discord] Document too large (%s bytes > cap %s), skipping: %s",
-                        att.size, max_doc_bytes, att.filename,
+                        "[Discord] Attachment exceeded the configured size cap; skipping",
                     )
+                    _attachment_card("oversized", limit_bytes=max_doc_bytes)
                 else:
                     try:
                         raw_bytes = await self._cache_discord_document(att, ext)
+                        validate_inbound_media_size(
+                            len(raw_bytes),
+                            media_type="attachment",
+                            max_bytes=max_doc_bytes,
+                        )
+                        if not raw_bytes:
+                            _attachment_card("unreadable", limit_bytes=max_doc_bytes)
+                            continue
+                        MAX_TEXT_INJECT_BYTES = 100 * 1024
+                        _is_text = (
+                            ext in _TEXT_INJECT_EXTENSIONS
+                            or (content_type or "").startswith("text/")
+                        )
+                        text_content = None
+                        if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                            try:
+                                text_content = raw_bytes.decode("utf-8")
+                            except UnicodeDecodeError:
+                                _attachment_card("unreadable", limit_bytes=max_doc_bytes)
+                                continue
                         cached_path = cache_document_from_bytes(
                             raw_bytes, att.filename or f"document{ext or '.bin'}"
                         )
@@ -8527,11 +8622,8 @@ class DiscordAdapter(BasePlatformAdapter):
                             )
                         media_urls.append(cached_path)
                         media_types.append(doc_mime)
-                        logger.info(
-                            "[Discord] Cached user %s: %s",
-                            "document" if in_allowlist else "attachment",
-                            cached_path,
-                        )
+                        _attachment_card("ready", limit_bytes=max_doc_bytes)
+                        logger.info("[Discord] Cached one user attachment privately")
                         # Inject text content for any text-readable document
                         # Inject text content for text-readable documents
                         # (capped at 100 KB). Gate on a text-like extension/MIME
@@ -8540,23 +8632,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         # but clearly-textual types (text/* MIME or a known text
                         # extension) are inlined too; everything else relies on
                         # ``gateway/run.py`` to emit a path-pointing context note.
-                        MAX_TEXT_INJECT_BYTES = 100 * 1024
-                        _is_text = (
-                            ext in _TEXT_INJECT_EXTENSIONS
-                            or (content_type or "").startswith("text/")
-                        )
-                        if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
-                            try:
-                                text_content = raw_bytes.decode("utf-8")
-                                display_name = att.filename or f"document{ext or '.txt'}"
-                                display_name = re.sub(r'[^\w.\- ]', '_', display_name)
-                                injection = f"[Content of {display_name}]:\n{text_content}"
-                                if pending_text_injection:
-                                    pending_text_injection = f"{pending_text_injection}\n\n{injection}"
-                                else:
-                                    pending_text_injection = injection
-                            except UnicodeDecodeError:
-                                pass
+                        if text_content is not None:
+                            display_name = att.filename or f"document{ext or '.txt'}"
+                            display_name = re.sub(r'[^\w.\- ]', '_', display_name)
+                            injection = f"[Content of {display_name}]:\n{text_content}"
+                            if pending_text_injection:
+                                pending_text_injection = f"{pending_text_injection}\n\n{injection}"
+                            else:
+                                pending_text_injection = injection
                         # NOTE: for the untyped-attachment path we deliberately
                         # do NOT inject a path string here. ``gateway/run.py``
                         # already detects DOCUMENT-typed events with
@@ -8565,9 +8648,15 @@ class DiscordAdapter(BasePlatformAdapter):
                         # ``to_agent_visible_cache_path()`` (important for
                         # Docker/Modal terminal backends).
                     except Exception as e:
+                        status = (
+                            "oversized"
+                            if isinstance(e, InboundMediaTooLargeError)
+                            else "download_failed"
+                        )
+                        _attachment_card(status, limit_bytes=max_doc_bytes)
                         logger.warning(
-                            "[Discord] Failed to cache document %s: %s",
-                            att.filename, e, exc_info=True,
+                            "[Discord] Failed to cache attachment (%s)",
+                            type(e).__name__,
                         )
 
         # Use normalized_content (saved before auto-threading) instead of message.content,
@@ -8683,6 +8772,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
+        event_metadata = {"stt_media_indexes": stt_media_indexes}
+        if intake_cards:
+            event_metadata["intake_cards"] = intake_cards
+        if voice_intake_source_refs:
+            event_metadata["voice_intake_source_refs"] = voice_intake_source_refs
+
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -8697,6 +8792,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
+            metadata=event_metadata,
         )
 
         # Track thread participation so the bot won't require @mention for

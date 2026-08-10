@@ -132,6 +132,11 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
         text="first follow-up",
         message_type=MessageType.TEXT,
         source=source,
+        metadata={
+            "intake_cards": [{"state_ref": "first"}],
+            "stt_media_indexes": [],
+            "voice_intake_source_refs": [],
+        },
     )
     photo_event = MessageEvent(
         text="see screenshot",
@@ -139,6 +144,11 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
         source=source,
         media_urls=["/tmp/test.png"],
         media_types=["image/png"],
+        metadata={
+            "intake_cards": [{"state_ref": "second"}],
+            "stt_media_indexes": [0],
+            "voice_intake_source_refs": ["voice-two"],
+        },
     )
 
     merge_pending_message_event(pending, session_key, text_event, merge_text=True)
@@ -149,6 +159,50 @@ def test_merge_pending_message_event_merges_text_and_photo_followups():
     assert merged.text == "first follow-up\n\nsee screenshot"
     assert merged.media_urls == ["/tmp/test.png"]
     assert merged.media_types == ["image/png"]
+    assert merged.metadata["intake_cards"] == [
+        {"state_ref": "first"},
+        {"state_ref": "second"},
+    ]
+    assert merged.metadata["stt_media_indexes"] == [0]
+    assert merged.metadata["voice_intake_source_refs"] == ["voice-two"]
+
+
+def test_merge_pending_message_event_offsets_stt_indexes_for_media_tail():
+    pending = {}
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="67890",
+        chat_type="dm",
+        user_id="u2",
+    )
+    session_key = build_session_key(source)
+    first = MessageEvent(
+        text="first",
+        message_type=MessageType.DOCUMENT,
+        source=source,
+        media_urls=["/tmp/first.pdf"],
+        media_types=["application/pdf"],
+        metadata={"stt_media_indexes": [], "voice_intake_source_refs": []},
+    )
+    second = MessageEvent(
+        text="second",
+        message_type=MessageType.VOICE,
+        source=source,
+        media_urls=["/tmp/voice.ogg"],
+        media_types=["audio/ogg"],
+        metadata={
+            "stt_media_indexes": [0],
+            "voice_intake_source_refs": ["voice-tail"],
+        },
+    )
+
+    merge_pending_message_event(pending, session_key, first)
+    merge_pending_message_event(pending, session_key, second)
+
+    merged = pending[session_key]
+    assert merged.media_urls == ["/tmp/first.pdf", "/tmp/voice.ogg"]
+    assert merged.metadata["stt_media_indexes"] == [1]
+    assert merged.metadata["voice_intake_source_refs"] == ["voice-tail"]
 
 
 @pytest.mark.asyncio
