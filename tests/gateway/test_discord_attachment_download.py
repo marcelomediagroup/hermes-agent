@@ -59,6 +59,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
+from gateway.operator_cards import OperatorCard  # noqa: E402
 from gateway.platforms.base import MessageType  # noqa: E402
 
 
@@ -254,5 +255,12 @@ class TestHandleMessageUsesAuthenticatedRead:
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == ["/tmp/img_from_read.png"]
         assert event.media_types == ["image/png"]
-
+        card = OperatorCard.from_mapping(event.metadata["intake_cards"][0])
+        assert card.title == "Attachment ready"
+        assert [action.id for action in card.actions] == [
+            "summarize",
+            "extract_tasks",
+            "turn_into_content_brief",
+            "create_oe_task",
+        ]
 

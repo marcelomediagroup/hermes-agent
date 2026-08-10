@@ -1138,8 +1138,9 @@ class TestDiscordVoiceChannelMethods:
 
 
     @pytest.mark.asyncio
-    async def test_process_voice_input_success(self):
+    async def test_process_voice_input_success(self, caplog):
         """Successful voice input: PCM->WAV->STT->callback."""
+        caplog.set_level("INFO")
         adapter = self._make_adapter()
         callback = AsyncMock()
         adapter._voice_input_callback = callback
@@ -1147,13 +1148,19 @@ class TestDiscordVoiceChannelMethods:
 
         pcm_data = b"\x00" * 96000
 
+        private_transcript = "private launch payment discussion"
         with patch("plugins.platforms.discord.adapter.VoiceReceiver.pcm_to_wav"), \
              patch("tools.transcription_tools.transcribe_audio",
-                   return_value={"success": True, "transcript": "Hello"}), \
+                   return_value={"success": True, "transcript": private_transcript}), \
              patch("tools.voice_mode.is_whisper_hallucination", return_value=False):
             await adapter._process_voice_input(111, 42, pcm_data)
 
-        callback.assert_called_once_with(guild_id=111, user_id=42, transcript="Hello")
+        callback.assert_called_once_with(
+            guild_id=111,
+            user_id=42,
+            transcript=private_transcript,
+        )
+        assert private_transcript not in caplog.text
 
 
         # Should not raise

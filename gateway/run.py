@@ -2688,6 +2688,11 @@ from gateway.platforms.base import (
     merge_pending_message_event,
     utf16_len,
 )
+from gateway.intake_cards import (
+    build_voice_note_blocked_card,
+    build_voice_note_intake_card,
+)
+from gateway.operator_cards import OperatorCard
 from gateway.shutdown_watchdog import (
     DEFAULT_HEARTBEAT_INTERVAL_S,
     DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
@@ -18423,6 +18428,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # concurrently preparing multimodal turns on the same runner.
         self._consume_pending_native_image_paths(session_key)
 
+        # Discord's adapter attaches content-free intake card mappings to the
+        # normalized event. Deliver them through the existing authenticated
+        # operator-card path before the agent turn, at most once per event.
+        await self._send_pending_intake_cards_once(
+            event,
+            self._adapter_for_source(source),
+            source,
+        )
+
         _is_shared_multi_user = is_shared_multi_user_session(
             source,
             group_sessions_per_user=_group_sessions_per_user,
@@ -18542,21 +18556,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # when configured. Lets users verify STT quality in real-time,
                 # while allowing quiet STT for users who only want the agent to
                 # receive the transcription.
-                if _successful_transcripts and self._should_echo_stt_transcripts():
-                    _echo_adapter = self._adapter_for_source(source)
-                    _echo_meta = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-                    if _echo_adapter:
-                        for _tx in _successful_transcripts:
-                            try:
-                                await _echo_adapter.send(
-                                    source.chat_id,
-                                    f'🎙️ "{_tx}"',
-                                    metadata=_echo_meta,
-                                )
-                            except Exception as _echo_exc:
-                                logger.debug(
-                                    "Transcript echo failed (non-fatal): %s", _echo_exc,
-                                )
+                _echo_adapter = self._adapter_for_source(source)
+                _echo_meta = self._thread_metadata_for_source(
+                    source,
+                    self._reply_anchor_for_event(event),
+                )
+                await self._echo_pending_stt_transcripts_once(
+                    event,
+                    _echo_adapter,
+                    source,
+                    _successful_transcripts,
+                    metadata=_echo_meta,
+                )
+                self._queue_discord_voice_intake_cards(
+                    event,
+                    source,
+                    transcripts=[],
+                    blocked_count=max(
+                        0,
+                        len(audio_paths) - len(_successful_transcripts),
+                    ),
+                    ordinal_offset=len(_successful_transcripts),
+                )
+                await self._send_pending_intake_cards_once(
+                    event,
+                    _echo_adapter,
+                    source,
+                    metadata=_echo_meta,
+                )
                 # NOTE: Previously, when transcription failed (e.g. no STT
                 # provider configured), the gateway also emitted a hardcoded
                 # English notice via `_stt_adapter.send()`. That bypassed the
@@ -22279,10 +22306,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
             logger.info(
-                "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
+                "Suppressing duplicate voice transcript for guild=%s user=%s "
+                "(%d characters)",
                 guild_id,
                 user_id,
-                transcript[:100],
+                len(transcript),
             )
             return
 
@@ -25150,6 +25178,122 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
         return enriched_text, successful_transcripts
 
+    @staticmethod
+    def _queue_discord_voice_intake_cards(
+        event,
+        source,
+        *,
+        transcripts: List[str],
+        blocked_count: int = 0,
+        ordinal_offset: int = 0,
+    ) -> None:
+        """Attach deterministic, content-bounded voice cards to an event."""
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return
+
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            metadata = {}
+            event.metadata = metadata
+        raw_cards = metadata.setdefault("intake_cards", [])
+        if not isinstance(raw_cards, list):
+            raw_cards = []
+            metadata["intake_cards"] = raw_cards
+
+        existing_refs = {
+            str(raw.get("state_ref"))
+            for raw in raw_cards
+            if isinstance(raw, dict) and raw.get("state_ref")
+        }
+        source_ref = str(
+            getattr(event, "message_id", None)
+            or getattr(source, "message_id", None)
+            or f"{getattr(source, 'chat_id', 'discord')}:{getattr(source, 'user_id', '')}"
+        )
+
+        new_cards = [
+            build_voice_note_intake_card(
+                transcript,
+                source_ref=source_ref,
+                ordinal=ordinal_offset + index,
+            )
+            for index, transcript in enumerate(transcripts)
+        ]
+        new_cards.extend(
+            build_voice_note_blocked_card(
+                source_ref=source_ref,
+                ordinal=ordinal_offset + len(transcripts) + index,
+            )
+            for index in range(max(0, int(blocked_count)))
+        )
+        for card in new_cards:
+            if card.state_ref not in existing_refs:
+                raw_cards.append(card.to_mapping())
+                existing_refs.add(card.state_ref)
+
+    async def _send_pending_intake_cards_once(
+        self,
+        event,
+        adapter,
+        source,
+        *,
+        metadata=None,
+    ) -> None:
+        """Send Discord intake cards via its authenticated action dispatcher."""
+        if getattr(source, "platform", None) != Platform.DISCORD or adapter is None:
+            return
+        event_metadata = getattr(event, "metadata", None)
+        if not isinstance(event_metadata, dict):
+            return
+        raw_cards = event_metadata.get("intake_cards")
+        if not isinstance(raw_cards, list) or not raw_cards:
+            return
+
+        sent_count = max(
+            0,
+            int(getattr(event, "_gateway_intake_cards_sent", 0) or 0),
+        )
+        for raw_card in raw_cards[sent_count:]:
+            try:
+                card = OperatorCard.from_mapping(raw_card)
+            except Exception as exc:
+                logger.warning(
+                    "Discord intake card validation failed (%s)",
+                    type(exc).__name__,
+                )
+                sent_count += 1
+                setattr(event, "_gateway_intake_cards_sent", sent_count)
+                continue
+
+            delivery_metadata = _non_conversational_metadata(
+                metadata
+                if metadata is not None
+                else self._thread_metadata_for_source(
+                    source,
+                    self._reply_anchor_for_event(event),
+                ),
+                platform=source.platform,
+            )
+            delivery_metadata = dict(delivery_metadata or {})
+            delivery_metadata["operator_card"] = card.to_mapping()
+            try:
+                result = await adapter.send(
+                    source.chat_id,
+                    card.title,
+                    metadata=delivery_metadata,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Discord intake card send failed (%s)",
+                    type(exc).__name__,
+                )
+                break
+            if getattr(result, "success", True) is False:
+                logger.warning("Discord intake card send returned failure")
+                break
+            sent_count += 1
+            setattr(event, "_gateway_intake_cards_sent", sent_count)
+
     async def _echo_pending_stt_transcripts_once(
         self,
         event,
@@ -25172,24 +25316,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         values because two separate notes that transcribe identically are two
         distinct deliveries and both must be echoed.
         """
-        if (
-            not transcripts
-            or not self._should_echo_stt_transcripts()
-            or adapter is None
-        ):
-            return
-        already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
-        unsent = transcripts[already_echoed:]
-        setattr(event, "_gateway_pending_stt_echoed", already_echoed + len(unsent))
-        for tx in unsent:
-            try:
-                await adapter.send(
-                    source.chat_id,
-                    f'🎙️ "{tx}"',
-                    metadata=metadata,
-                )
-            except Exception as echo_exc:
-                logger.debug("%s echo failed (non-fatal): %s", log_context, echo_exc)
+        self._queue_discord_voice_intake_cards(
+            event,
+            source,
+            transcripts=transcripts,
+        )
+        if transcripts and self._should_echo_stt_transcripts() and adapter is not None:
+            already_echoed = int(
+                getattr(event, "_gateway_pending_stt_echoed", 0) or 0
+            )
+            unsent = transcripts[already_echoed:]
+            setattr(event, "_gateway_pending_stt_echoed", already_echoed + len(unsent))
+            for tx in unsent:
+                try:
+                    await adapter.send(
+                        source.chat_id,
+                        f'🎙️ "{tx}"',
+                        metadata=metadata,
+                    )
+                except Exception as echo_exc:
+                    logger.debug(
+                        "%s echo failed (non-fatal, %s)",
+                        log_context,
+                        type(echo_exc).__name__,
+                    )
+        await self._send_pending_intake_cards_once(
+            event,
+            adapter,
+            source,
+            metadata=metadata,
+        )
 
     async def _transcribe_and_echo_pending_voice(
         self,
@@ -25212,7 +25368,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         The caller is responsible for the ``_build_media_placeholder`` fallback
         when ``text`` is empty and the event has non-audio media.
         """
-        if not self._pending_event_audio_paths(event):
+        audio_paths = self._pending_event_audio_paths(event)
+        if not audio_paths:
             return text, []
         try:
             enriched_text, transcripts = await self._transcribe_pending_audio_event_once(
@@ -25231,9 +25388,45 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 metadata=echo_meta,
                 log_context=log_context,
             )
+            self._queue_discord_voice_intake_cards(
+                event,
+                source,
+                transcripts=[],
+                blocked_count=max(0, len(audio_paths) - len(transcripts)),
+                ordinal_offset=len(transcripts),
+            )
+            await self._send_pending_intake_cards_once(
+                event,
+                adapter,
+                source,
+                metadata=echo_meta,
+            )
             return enriched_text or text, transcripts
         except Exception as trans_exc:
-            logger.warning("%s transcription failed: %s", log_context, trans_exc)
+            logger.warning(
+                "%s transcription failed (%s)",
+                log_context,
+                type(trans_exc).__name__,
+            )
+            self._queue_discord_voice_intake_cards(
+                event,
+                source,
+                transcripts=[],
+                blocked_count=len(audio_paths),
+            )
+            await self._send_pending_intake_cards_once(
+                event,
+                adapter,
+                source,
+                metadata=(
+                    self._thread_metadata_for_source(
+                        source,
+                        self._reply_anchor_for_event(event),
+                    )
+                    if metadata is _UNSET
+                    else metadata
+                ),
+            )
             return text, []
 
     def _build_process_event_source(self, evt: dict):
