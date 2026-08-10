@@ -33,7 +33,7 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.i18n import t
 from agent.turn_context import extract_api_content_sidecar
 from gateway.config import HomeChannel, Platform, PlatformConfig, persist_home_channel
-from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType
+from gateway.platforms.base import EphemeralReply, MessageEvent, MessageType, OperatorCardReply
 from gateway.session import (
     AsyncSessionStore,
     SessionSource,
@@ -127,6 +127,103 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+
+    def _operator_digest_source_config(self):
+        from gateway.operator_digests import DigestSourceConfig
+
+        return DigestSourceConfig.from_gateway_config(getattr(self, "config", None))
+
+    @staticmethod
+    def _operator_card_reply(card) -> OperatorCardReply:
+        from gateway.operator_cards import render_operator_card_text
+
+        return OperatorCardReply(render_operator_card_text(card), card.to_mapping())
+
+    @staticmethod
+    def _running_process_snapshot() -> tuple[list[dict], bool]:
+        from tools.process_registry import process_registry
+
+        try:
+            return (
+                [
+                    process
+                    for process in process_registry.list_sessions()
+                    if process.get("status") == "running"
+                ],
+                True,
+            )
+        except Exception:
+            logger.warning("Process registry read failed for operator digest", exc_info=True)
+            return [], False
+
+    @staticmethod
+    def _operator_digest_disabled_reply(command: str) -> str:
+        return f"The `/{command}` command is not enabled for this gateway."
+
+    async def _handle_today_command(
+        self,
+        event: MessageEvent,
+    ) -> str | OperatorCardReply:
+        digest_config = self._operator_digest_source_config()
+        if not digest_config.enabled:
+            return self._operator_digest_disabled_reply("today")
+        from gateway.operator_digests import build_today_card
+
+        running_processes, processes_available = self._running_process_snapshot()
+        active_agents = len(getattr(self, "_running_agents", {}) or {})
+        card = await asyncio.to_thread(
+            build_today_card,
+            digest_config,
+            active_agents=active_agents,
+            process_count=len(running_processes) if processes_available else None,
+            process_source_available=processes_available,
+        )
+        return self._operator_card_reply(card)
+
+    async def _handle_changes_command(
+        self,
+        event: MessageEvent,
+    ) -> str | OperatorCardReply:
+        digest_config = self._operator_digest_source_config()
+        if not digest_config.enabled:
+            return self._operator_digest_disabled_reply("changes")
+        from gateway.operator_digests import build_changes_card
+
+        card = await asyncio.to_thread(
+            build_changes_card,
+            digest_config,
+        )
+        return self._operator_card_reply(card)
+
+    async def _handle_decisions_command(
+        self,
+        event: MessageEvent,
+    ) -> str | OperatorCardReply:
+        digest_config = self._operator_digest_source_config()
+        if not digest_config.enabled:
+            return self._operator_digest_disabled_reply("decisions")
+        from gateway.operator_digests import build_decisions_card
+
+        card = await asyncio.to_thread(
+            build_decisions_card,
+            digest_config,
+        )
+        return self._operator_card_reply(card)
+
+    async def _handle_ops_command(
+        self,
+        event: MessageEvent,
+    ) -> str | OperatorCardReply:
+        digest_config = self._operator_digest_source_config()
+        if not digest_config.enabled:
+            return self._operator_digest_disabled_reply("ops")
+        from gateway.operator_digests import build_ops_card
+
+        card = await asyncio.to_thread(
+            build_ops_card,
+            digest_config,
+        )
+        return self._operator_card_reply(card)
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1272,10 +1369,13 @@ class GatewaySlashCommandsMixin:
             return True
         return await self._resume_target_allowed(source, sid, allow_override=False)
 
-    async def _handle_agents_command(self, event: MessageEvent) -> str:
+    async def _handle_agents_command(
+        self,
+        event: MessageEvent,
+    ) -> str | OperatorCardReply:
         """Handle /agents command - list active agents and running tasks."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        from tools.process_registry import format_uptime_short, process_registry
+        from tools.process_registry import format_uptime_short
 
         now = time.time()
         current_session_key = self._session_key_for_source(event.source)
@@ -1300,14 +1400,7 @@ class GatewaySlashCommandsMixin:
 
         agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
 
-        running_processes: list[dict] = []
-        try:
-            running_processes = [
-                p for p in process_registry.list_sessions()
-                if p.get("status") == "running"
-            ]
-        except Exception:
-            running_processes = []
+        running_processes, processes_available = self._running_process_snapshot()
 
         background_tasks = [
             t for t in (getattr(self, "_background_tasks", set()) or set())
@@ -1332,12 +1425,11 @@ class GatewaySlashCommandsMixin:
             if len(agent_rows) > 12:
                 lines.append(t("gateway.agents.more", count=len(agent_rows) - 12))
 
-        lines.extend(
-            [
-                "",
-                t("gateway.agents.running_processes", count=len(running_processes)),
-            ]
-        )
+        lines.append("")
+        if processes_available:
+            lines.append(t("gateway.agents.running_processes", count=len(running_processes)))
+        else:
+            lines.append("**Running background processes:** Unavailable (process registry read failed)")
         if running_processes:
             for proc in running_processes[:12]:
                 cmd = " ".join(str(proc.get("command", "")).split())
@@ -1414,14 +1506,55 @@ class GatewaySlashCommandsMixin:
 
         if (
             not agent_rows
-            and not running_processes
+            and (not running_processes if processes_available else True)
             and not background_tasks
             and not delegations
         ):
             lines.append("")
             lines.append(t("gateway.agents.none"))
 
-        return "\n".join(lines)
+        fallback = "\n".join(lines)
+        digest_config = self._operator_digest_source_config()
+        if not digest_config.enabled:
+            return fallback
+
+        from gateway.operator_cards import OperatorCard
+        from gateway.operator_digests import ops_rollup_text
+
+        ops_rollup = await asyncio.to_thread(
+            ops_rollup_text,
+            digest_config,
+        )
+        lines.extend(["", f"**Open Engine health:** {ops_rollup}"])
+        fallback = "\n".join(lines)
+        details = "\n".join(lines[3:])[:1024].strip() or "No active runtime work."
+        process_summary = (
+            f"{len(running_processes)} running"
+            if processes_available
+            else "Unavailable (process registry read failed)"
+        )
+        card = OperatorCard.from_mapping(
+            {
+                "kind": "operator_card",
+                "version": 1,
+                "card_type": "digest",
+                "title": "Active agents & tasks",
+                "severity": "needs_review" if not processes_available else "info",
+                "summary": f"{len(agent_rows)} active agents; process registry: {process_summary}.",
+                "fields": [
+                    {"label": "Runtime details", "value": details},
+                    {"label": "Open Engine health", "value": ops_rollup[:1024]},
+                    {
+                        "label": "Source",
+                        "value": "Hermes gateway runtime + process registry + m-os cron-runner state",
+                    },
+                ],
+                "actions": [],
+                "links": [],
+                "state_ref": f"digest:agents:{int(now // 60)}",
+            }
+        )
+        return OperatorCardReply(fallback, card.to_mapping())
 
     async def _handle_stop_command(self, event: MessageEvent) -> Union[str, EphemeralReply]:
         """Handle /stop command - interrupt a running agent.

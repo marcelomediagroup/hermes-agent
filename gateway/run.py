@@ -16518,6 +16518,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "deny": self._handle_deny_command,
                 "pause": self._handle_pause_command,
                 "agents": self._handle_agents_command,
+                "today": self._handle_today_command,
+                "changes": self._handle_changes_command,
+                "decisions": self._handle_decisions_command,
+                "ops": self._handle_ops_command,
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
@@ -17685,6 +17689,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
+
+        if canonical == "today":
+            return await self._handle_today_command(event)
+
+        if canonical == "changes":
+            return await self._handle_changes_command(event)
+
+        if canonical == "decisions":
+            return await self._handle_decisions_command(event)
+
+        if canonical == "ops":
+            return await self._handle_ops_command(event)
 
         if canonical == "platform":
             return await self._handle_platform_command(event)

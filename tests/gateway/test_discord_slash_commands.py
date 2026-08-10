@@ -174,6 +174,27 @@ async def test_run_simple_slash_executes_when_defer_interaction_expired(adapter)
 # ------------------------------------------------------------------
 
 
+def test_operator_digest_commands_stay_hidden_without_config_gate(adapter, monkeypatch):
+    monkeypatch.setattr("hermes_cli.commands._resolve_config_gates", lambda: set())
+
+    adapter._register_slash_commands()
+
+    tree_names = set(adapter._client.tree.commands)
+    assert {"today", "changes", "decisions", "ops"}.isdisjoint(tree_names)
+
+
+def test_auto_registers_operator_digest_commands_from_registry(adapter, monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.commands._resolve_config_gates",
+        lambda: {"today", "changes", "decisions", "ops"},
+    )
+
+    adapter._register_slash_commands()
+
+    tree_names = set(adapter._client.tree.commands)
+    assert {"today", "changes", "decisions", "ops"} <= tree_names
+
+
 @pytest.mark.asyncio
 async def test_auto_registers_plugin_commands_for_discord(adapter):
     """Plugin slash commands should appear as native Discord app commands."""
@@ -600,5 +621,3 @@ def test_register_skill_command_payload_fits_discord_8kb_limit(adapter):
         f"Flat /skill command payload is ~{len(payload)} bytes — the whole "
         f"point of this design is that it stays small regardless of skill count"
     )
-
-
