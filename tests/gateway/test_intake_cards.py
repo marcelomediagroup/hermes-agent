@@ -347,3 +347,88 @@ async def test_document_first_mixed_media_still_transcribes_native_voice():
         adapter.send.await_args_list[-1].kwargs["metadata"]["operator_card"]
     )
     assert card.title == "Voice note ready"
+
+
+@pytest.mark.asyncio
+async def test_partial_voice_failure_preserves_each_source_identity():
+    adapter = SimpleNamespace(
+        send=AsyncMock(return_value=SendResult(success=True, message_id="sent"))
+    )
+    runner = _discord_voice_runner(adapter)
+    event, source = _discord_voice_event()
+    event.media_urls = [
+        "/private/cache/first.ogg",
+        "/private/cache/second.ogg",
+    ]
+    event.media_types = ["audio/ogg", "audio/ogg"]
+    event.metadata = {
+        "stt_media_indexes": [0, 1],
+        "voice_intake_source_refs": ["voice-source-first", "voice-source-second"],
+    }
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=[
+            {"success": False, "error": "first failed"},
+            {"success": True, "transcript": "second succeeded", "provider": "mock"},
+        ],
+    ), patch(
+        "tools.transcription_tools.transcribe_audio_local_fallback",
+        return_value={"success": False, "error": "fallback failed"},
+    ):
+        await runner._prepare_inbound_message_text(
+            event=event,
+            source=source,
+            history=[],
+        )
+
+    delivered_cards = [
+        OperatorCard.from_mapping(call.kwargs["metadata"]["operator_card"])
+        for call in adapter.send.await_args_list
+        if call.kwargs.get("metadata", {}).get("operator_card")
+    ]
+    assert [card.title for card in delivered_cards] == [
+        "Voice note blocked",
+        "Voice note ready",
+    ]
+    assert delivered_cards[0].state_ref == build_voice_note_blocked_card(
+        source_ref="voice-source-first",
+        ordinal=0,
+    ).state_ref
+    assert delivered_cards[1].state_ref == build_voice_note_intake_card(
+        "second succeeded",
+        source_ref="voice-source-second",
+        ordinal=1,
+    ).state_ref
+
+
+@pytest.mark.asyncio
+async def test_pending_voice_cache_retains_input_aligned_outcomes():
+    runner = _discord_voice_runner(SimpleNamespace(send=AsyncMock()))
+    event, _source = _discord_voice_event()
+    event.media_urls = [
+        "/private/cache/first.ogg",
+        "/private/cache/second.ogg",
+    ]
+    event.media_types = ["audio/ogg", "audio/ogg"]
+    event.metadata = {
+        "stt_media_indexes": [0, 1],
+        "voice_intake_source_refs": ["voice-source-first", "voice-source-second"],
+    }
+
+    with patch(
+        "tools.transcription_tools.transcribe_audio",
+        side_effect=[
+            {"success": False, "error": "first failed"},
+            {"success": True, "transcript": "second succeeded", "provider": "mock"},
+        ],
+    ) as transcribe, patch(
+        "tools.transcription_tools.transcribe_audio_local_fallback",
+        return_value={"success": False, "error": "fallback failed"},
+    ):
+        _text, first = await runner._transcribe_pending_audio_event_once(event)
+        _cached_text, cached = await runner._transcribe_pending_audio_event_once(event)
+
+    assert first == cached == ["second succeeded"]
+    assert first.outcomes == cached.outcomes == (None, "second succeeded")
+    assert transcribe.call_count == 2
