@@ -2690,6 +2690,27 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _merge_pending_intake_cards(existing: MessageEvent, incoming: MessageEvent) -> None:
+    """Preserve ordered intake-card deliveries when media events coalesce."""
+    incoming_metadata = getattr(incoming, "metadata", None)
+    incoming_cards = (
+        incoming_metadata.get("intake_cards")
+        if isinstance(incoming_metadata, dict)
+        else None
+    )
+    if not isinstance(incoming_cards, list) or not incoming_cards:
+        return
+    existing_metadata = getattr(existing, "metadata", None)
+    if not isinstance(existing_metadata, dict):
+        existing_metadata = {}
+        existing.metadata = existing_metadata
+    existing_cards = existing_metadata.setdefault("intake_cards", [])
+    if not isinstance(existing_cards, list):
+        existing_cards = []
+        existing_metadata["intake_cards"] = existing_cards
+    existing_cards.extend(incoming_cards)
+
+
 def merge_pending_message_event(
     pending_messages: Dict[str, MessageEvent],
     session_key: str,
@@ -2720,6 +2741,7 @@ def merge_pending_message_event(
             existing.media_types.extend(event.media_types)
             if event.text:
                 existing.text = BasePlatformAdapter._merge_caption(existing.text, event.text)
+            _merge_pending_intake_cards(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2739,6 +2761,7 @@ def merge_pending_message_event(
                 and event.message_type != MessageType.TEXT
             ):
                 existing.message_type = event.message_type
+            _merge_pending_intake_cards(existing, event)
             _invalidate_pending_stt_cache(existing)
             return
 
@@ -2749,6 +2772,7 @@ def merge_pending_message_event(
         ):
             if event.text:
                 existing.text = f"{existing.text}\n{event.text}" if existing.text else event.text
+            _merge_pending_intake_cards(existing, event)
             return
 
     pending_messages[session_key] = event
