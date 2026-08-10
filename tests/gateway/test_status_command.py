@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
-from gateway.platforms.base import MessageEvent
+from gateway.platforms.base import MessageEvent, OperatorCardReply
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
@@ -208,6 +208,88 @@ async def test_tasks_alias_routes_to_agents_command(monkeypatch):
     result = await runner._handle_message(_make_event("/tasks"))
 
     assert "Active Agents & Tasks" in result
+
+
+@pytest.mark.asyncio
+async def test_agents_command_reports_process_registry_failure_as_unavailable(monkeypatch):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source()),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry)
+    runner._background_tasks = set()
+
+    class _BrokenRegistry:
+        def list_sessions(self):
+            raise OSError("registry unavailable")
+
+    monkeypatch.setattr("tools.process_registry.process_registry", _BrokenRegistry())
+
+    result = await runner._handle_message(_make_event("/agents"))
+
+    assert "**Running background processes:** Unavailable" in result
+    assert "**Running background processes:** 0" not in result
+
+
+@pytest.mark.parametrize(
+    ("command", "title"),
+    [
+        ("today", "Today"),
+        ("changes", "Changes"),
+        ("decisions", "Decisions"),
+        ("ops", "Operations"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_digest_commands_return_operator_card_replies(tmp_path, command, title):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source(Platform.DISCORD)),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry, platform=Platform.DISCORD)
+    runner.config.platforms[Platform.DISCORD].extra["operator_digests"] = {
+        "enabled": True,
+        "m_os_root": str(tmp_path / "missing-m-os"),
+        "state_root": str(tmp_path / "missing-state"),
+        "hermes_root": str(tmp_path / "missing-hermes"),
+    }
+
+    result = await runner._handle_message(_make_event(f"/{command}", platform=Platform.DISCORD))
+
+    assert isinstance(result, OperatorCardReply)
+    assert result.operator_card["title"].startswith(title)
+    assert "Unavailable" in result
+
+
+@pytest.mark.parametrize("command", ["today", "changes", "decisions", "ops"])
+@pytest.mark.asyncio
+async def test_digest_commands_require_explicit_enablement(command):
+    session_entry = SessionEntry(
+        session_key=build_session_key(_make_source(Platform.DISCORD)),
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type="dm",
+        total_tokens=0,
+    )
+    runner = _make_runner(session_entry, platform=Platform.DISCORD)
+
+    result = await runner._handle_message(
+        _make_event(f"/{command}", platform=Platform.DISCORD)
+    )
+
+    assert result == f"The `/{command}` command is not enabled for this gateway."
 
 
 @pytest.mark.asyncio
@@ -486,5 +568,3 @@ async def test_context_all_appends_expanded_listings():
     assert "hermes-agent" in result
     # Expanded view drops the hint
     assert "Use /context all" not in result
-
-

@@ -1,5 +1,6 @@
 """Tests for the central command registry and autocomplete."""
 
+import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
@@ -296,6 +297,29 @@ class TestGatewayConfigGate:
 
         mapping = slack_subcommand_map()
         assert "verbose" in mapping
+
+    @pytest.mark.parametrize(
+        "yaml_text",
+        [
+            "platforms:\n  discord:\n    extra:\n      operator_digests:\n        enabled: true\n",
+            "gateway:\n  platforms:\n    discord:\n      extra:\n        operator_digests:\n          enabled: true\n",
+        ],
+    )
+    def test_operator_digest_gate_uses_real_supported_config_shapes(
+        self,
+        tmp_path,
+        monkeypatch,
+        yaml_text,
+    ):
+        (tmp_path / "config.yaml").write_text(yaml_text)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        joined = "\n".join(gateway_help_lines())
+
+        assert "`/today`" in joined
+        assert "`/changes`" in joined
+        assert "`/decisions`" in joined
+        assert "`/ops`" in joined
 
 
 # ---------------------------------------------------------------------------

@@ -576,7 +576,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -2666,6 +2666,38 @@ class EphemeralReply(str):
         return str.__str__(self)
 
 
+class OperatorCardReply(str):
+    """Text fallback plus validated operator-card delivery metadata.
+
+    Keeping the fallback as a ``str`` preserves every non-rich platform path.
+    The normal outbound pipeline adds ``operator_card`` to delivery metadata,
+    allowing Discord to render the same response as an embed without a second
+    send or an adapter-specific command handler.
+    """
+
+    operator_card: Dict[str, Any]
+
+    def __new__(cls, text: str, operator_card: Mapping[str, Any]):
+        instance = super().__new__(cls, text)
+        instance.operator_card = dict(operator_card)
+        return instance
+
+
+def _operator_card_delivery_metadata(response: Any) -> Dict[str, Any]:
+    if not isinstance(response, OperatorCardReply):
+        return {}
+    return {"operator_card": dict(response.operator_card)}
+
+
+def _final_response_delivery_metadata(
+    response: Any,
+    thread_metadata: dict | None,
+) -> Dict[str, Any]:
+    metadata = _mark_notify_metadata(thread_metadata)
+    metadata.update(_operator_card_delivery_metadata(response))
+    return metadata
+
+
 def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     """Clear gateway-side STT cache attrs when media is merged into an event.
 
@@ -2775,9 +2807,13 @@ _RETRYABLE_ERROR_PATTERNS = (
 
 
 # Type for message handlers.  Handlers may return a plain string (normal
-# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, or
-# ``None`` when the response was already delivered (e.g. via streaming).
-MessageHandler = Callable[[MessageEvent], Awaitable[Optional[Union[str, "EphemeralReply"]]]]
+# reply), an ``EphemeralReply`` to opt the reply into auto-deletion, an
+# ``OperatorCardReply`` to attach the validated rich-card envelope, or ``None``
+# when the response was already delivered (e.g. via streaming).
+MessageHandler = Callable[
+    [MessageEvent],
+    Awaitable[Optional[Union[str, "EphemeralReply", "OperatorCardReply"]]],
+]
 
 
 def resolve_channel_prompt(
@@ -5889,6 +5925,10 @@ class BasePlatformAdapter(ABC):
 
         try:
             response = await self._message_handler(event)
+            _delivery_metadata = _final_response_delivery_metadata(
+                response,
+                thread_meta,
+            )
             _text, _eph_ttl = self._unwrap_ephemeral(response)
             # Send the response BEFORE cancelling the old task so the send
             # cannot be affected by task-cancellation side effects (race
@@ -5907,7 +5947,7 @@ class BasePlatformAdapter(ABC):
                     chat_id=event.source.chat_id,
                     content=_text,
                     reply_to=_reply_anchor_for_event(event),
-                    metadata=_mark_notify_metadata(thread_meta),
+                    metadata=_delivery_metadata,
                 )
                 if _eph_ttl > 0 and _r.success and _r.message_id:
                     self._schedule_ephemeral_delete(
@@ -6017,13 +6057,17 @@ class BasePlatformAdapter(ABC):
                 try:
                     _thread_meta = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
                     response = await self._message_handler(event)
+                    _delivery_metadata = _final_response_delivery_metadata(
+                        response,
+                        _thread_meta,
+                    )
                     _text, _eph_ttl = self._unwrap_ephemeral(response)
                     if _text:
                         _r = await self._send_with_retry(
                             chat_id=event.source.chat_id,
                             content=_text,
                             reply_to=_reply_anchor_for_event(event),
-                            metadata=_mark_notify_metadata(_thread_meta),
+                            metadata=_delivery_metadata,
                         )
                         if _eph_ttl > 0 and _r.success and _r.message_id:
                             self._schedule_ephemeral_delete(
@@ -6070,13 +6114,17 @@ class BasePlatformAdapter(ABC):
                             event.source, _reply_anchor_for_event(event)
                         )
                         response = await self._message_handler(event)
+                        _delivery_metadata = _final_response_delivery_metadata(
+                            response,
+                            _thread_meta,
+                        )
                         _text, _eph_ttl = self._unwrap_ephemeral(response)
                         if _text:
                             _r = await self._send_with_retry(
                                 chat_id=event.source.chat_id,
                                 content=_text,
                                 reply_to=_reply_anchor_for_event(event),
-                                metadata=_mark_notify_metadata(_thread_meta),
+                                metadata=_delivery_metadata,
                             )
                             if _eph_ttl > 0 and _r.success and _r.message_id:
                                 self._schedule_ephemeral_delete(
@@ -6220,6 +6268,7 @@ class BasePlatformAdapter(ABC):
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
             is_ephemeral_response = isinstance(response, EphemeralReply)
+            _operator_card_metadata = _operator_card_delivery_metadata(response)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
             # request that their reply message auto-delete after a TTL (used
@@ -6345,6 +6394,8 @@ class BasePlatformAdapter(ABC):
                         _reply_anchor_for_event(event),
                     )
                 )
+                if _operator_card_metadata:
+                    _final_thread_metadata.update(_operator_card_metadata)
 
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has

@@ -150,6 +150,18 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("bg", "btw"), args_hint="<prompt>", busy_policy="dispatch"),
     CommandDef("agents", "Show active agents and running tasks", "Session",
                aliases=("tasks",), busy_policy="dispatch"),
+    CommandDef("today", "Show today's decisions, failures, deadlines, and active work", "Session",
+               gateway_only=True, gateway_config_gate="platforms.discord.extra.operator_digests.enabled",
+               busy_policy="dispatch"),
+    CommandDef("changes", "Show recent repository, completion, and freshness changes", "Session",
+               gateway_only=True, gateway_config_gate="platforms.discord.extra.operator_digests.enabled",
+               busy_policy="dispatch"),
+    CommandDef("decisions", "Show the human-decision queue", "Session",
+               gateway_only=True, gateway_config_gate="platforms.discord.extra.operator_digests.enabled",
+               busy_policy="dispatch"),
+    CommandDef("ops", "Show read-only infrastructure and queue health", "Session",
+               gateway_only=True, gateway_config_gate="platforms.discord.extra.operator_digests.enabled",
+               busy_policy="dispatch"),
     CommandDef("journey", "Open the learning journey timeline",
                "Session", aliases=("learning", "memory-graph"), cli_only=True,
                args_hint="[list|delete <id>|edit <id>]",
@@ -514,15 +526,24 @@ def _resolve_config_gates() -> set[str]:
         cfg = read_raw_config()
     except Exception:
         return set()
+
+    def _walk(mapping: Any, dotpath: str) -> tuple[bool, Any]:
+        value = mapping
+        for key in dotpath.split("."):
+            if not isinstance(value, dict) or key not in value:
+                return False, None
+            value = value[key]
+        return True, value
+
     result: set[str] = set()
     for cmd in gated:
-        val: Any = cfg
-        for key in cmd.gateway_config_gate.split("."):
-            if isinstance(val, dict):
-                val = val.get(key)
-            else:
-                val = None
-                break
+        found, val = _walk(cfg, cmd.gateway_config_gate)
+        if not found:
+            # GatewayConfig accepts runtime-only platform settings below
+            # ``gateway.platforms`` as a fallback to top-level ``platforms``.
+            # Command discovery must resolve the same two shapes or a command
+            # can be executable while remaining absent from native menus.
+            _, val = _walk(cfg.get("gateway"), cmd.gateway_config_gate)
         if is_truthy_value(val, default=False):
             result.add(cmd.name)
     return result
@@ -531,17 +552,15 @@ def _resolve_config_gates() -> set[str]:
 def _is_gateway_available(cmd: CommandDef, config_overrides: set[str] | None = None) -> bool:
     """Check if *cmd* should appear in gateway surfaces (help, menus, mappings).
 
-    Unconditionally available when ``cli_only`` is False.  When ``cli_only``
-    is True but ``gateway_config_gate`` is set, the command is available only
-    when the config value is truthy.  Pass *config_overrides* (from
-    ``_resolve_config_gates()``) to avoid re-reading config for every command.
+    A ``gateway_config_gate`` always wins: the command is available only when
+    its config value is truthy. Otherwise, availability is the inverse of
+    ``cli_only``. Pass *config_overrides* (from ``_resolve_config_gates()``) to
+    avoid re-reading config for every command.
     """
-    if not cmd.cli_only:
-        return True
     if cmd.gateway_config_gate:
         overrides = config_overrides if config_overrides is not None else _resolve_config_gates()
         return cmd.name in overrides
-    return False
+    return not cmd.cli_only
 
 
 def _requires_argument(args_hint: str) -> bool:
@@ -1277,7 +1296,28 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     native slash.
 #   - pause: global emergency stop; reached via /hermes pause [off] on
 #     Slack. Added at the 50-cap — a native slot would clamp /platform.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "pause"})
+#   - today, changes, decisions, ops: Discord-first operator digests. Slack
+#     retains their plaintext fallback through /hermes without displacing four
+#     established native commands at the hard 50-command cap.
+_SLACK_VIA_HERMES_ONLY = frozenset(
+    {
+        "topup",
+        "moa",
+        "debug",
+        "egress",
+        "init",
+        "version",
+        "diff",
+        "update",
+        "heartbeat",
+        "refine",
+        "pause",
+        "today",
+        "changes",
+        "decisions",
+        "ops",
+    }
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:

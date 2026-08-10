@@ -17,7 +17,12 @@ import asyncio
 import pytest
 
 from gateway.config import Platform, PlatformConfig
-from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    OperatorCardReply,
+)
 from gateway.session import SessionSource, build_session_key
 
 
@@ -48,6 +53,7 @@ def _make_adapter():
     adapter = _StubAdapter(config, Platform.TELEGRAM)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
+    adapter.sent_metadata = []
 
     async def _mock_handler(event):
         cmd = event.get_command()
@@ -57,6 +63,7 @@ def _make_adapter():
 
     async def _mock_send_retry(chat_id, content, **kwargs):
         adapter.sent_responses.append(content)
+        adapter.sent_metadata.append(kwargs.get("metadata"))
 
     adapter._send_with_retry = _mock_send_retry
     return adapter
@@ -99,6 +106,59 @@ class TestCommandBypassActiveSession:
         assert any("handled:stop" in r for r in adapter.sent_responses), (
             "/stop response was not sent back to the user"
         )
+
+    @pytest.mark.asyncio
+    async def test_operator_card_reply_uses_busy_delivery_metadata_pipeline(self):
+        adapter = _make_adapter()
+        adapter._active_sessions[_session_key()] = asyncio.Event()
+        payload = {
+            "kind": "operator_card",
+            "version": 1,
+            "card_type": "digest",
+            "title": "Today",
+            "severity": "info",
+            "summary": "Read-only status.",
+            "fields": [],
+            "actions": [],
+            "links": [],
+            "state_ref": "digest:today:test",
+        }
+
+        async def _handler(_event):
+            return OperatorCardReply("fallback", payload)
+
+        adapter._message_handler = _handler
+        await adapter.handle_message(_make_event("/today"))
+
+        assert adapter.sent_responses == ["fallback"]
+        assert adapter.sent_metadata[0]["operator_card"] == payload
+
+    @pytest.mark.asyncio
+    async def test_operator_card_reply_uses_normal_delivery_metadata_pipeline(self):
+        adapter = _make_adapter()
+        session_key = _session_key()
+        adapter._active_sessions[session_key] = asyncio.Event()
+        payload = {
+            "kind": "operator_card",
+            "version": 1,
+            "card_type": "digest",
+            "title": "Today",
+            "severity": "info",
+            "summary": "Read-only status.",
+            "fields": [],
+            "actions": [],
+            "links": [],
+            "state_ref": "digest:today:test",
+        }
+
+        async def _handler(_event):
+            return OperatorCardReply("fallback", payload)
+
+        adapter._message_handler = _handler
+        await adapter._process_message_background(_make_event("/today"), session_key)
+
+        assert adapter.sent_responses == ["fallback"]
+        assert adapter.sent_metadata[0]["operator_card"] == payload
 
     @pytest.mark.asyncio
     async def test_new_bypasses_guard(self):
@@ -171,6 +231,18 @@ class TestCommandBypassActiveSession:
 
         assert sk not in adapter._pending_messages
         assert any("handled:agents" in r for r in adapter.sent_responses)
+
+    @pytest.mark.parametrize("command", ["today", "changes", "decisions", "ops"])
+    @pytest.mark.asyncio
+    async def test_operator_digests_bypass_active_session(self, command):
+        adapter = _make_adapter()
+        sk = _session_key()
+        adapter._active_sessions[sk] = asyncio.Event()
+
+        await adapter.handle_message(_make_event(f"/{command}"))
+
+        assert sk not in adapter._pending_messages
+        assert any(f"handled:{command}" in r for r in adapter.sent_responses)
 
     @pytest.mark.asyncio
     async def test_tasks_alias_bypasses_guard(self):
@@ -438,4 +510,3 @@ class TestBypassWithBotnameSuffix:
             "/stop@MyHermesBot was queued instead of bypassing"
         )
         assert any("handled:stop" in r for r in adapter.sent_responses)
-
