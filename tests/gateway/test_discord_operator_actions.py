@@ -15,6 +15,7 @@ from plugins.platforms.discord.adapter import (
     DiscordAdapter,
     OperatorActionDynamicItem,
     _build_operator_card_view,
+    build_operator_card_embed,
 )
 
 
@@ -118,6 +119,21 @@ def test_validated_actions_build_bounded_opaque_buttons_with_safe_styles(tmp_pat
     )
     assert all(len(button.custom_id.encode("utf-8")) <= 100 for button in buttons)
     assert all(card.state_ref not in button.custom_id for button in buttons)
+
+
+def test_public_embed_renderer_preserves_the_validated_operator_card_contract():
+    card = OperatorCard.from_mapping(_card_payload())
+
+    embed = build_operator_card_embed(card)
+
+    assert embed.title == card.title
+    assert embed.description == card.summary
+    assert embed.fields[0] == {
+        "name": "Issue",
+        "value": "OE-175",
+        "inline": False,
+    }
+    assert embed.footer["text"] == "Approval · Needs review"
 
 
 def test_one_global_dynamic_router_is_registered_per_discord_client(
