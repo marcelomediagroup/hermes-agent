@@ -2689,6 +2689,7 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
     for attr in (
         "_gateway_pending_stt_text",
         "_gateway_pending_stt_transcripts",
+        "_gateway_pending_stt_outcomes",
     ):
         if hasattr(event, attr):
             delattr(event, attr)

@@ -93,6 +93,21 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+class _TranscriptionResults(list):
+    """Successful transcripts plus one outcome slot per input attachment.
+
+    The list surface preserves the established caller contract: transcript
+    echoing and agent enrichment only consume successful strings. ``outcomes``
+    retains the input-aligned result needed by operator intake cards so a
+    failed first clip cannot steal a later clip's source identity.
+    """
+
+    def __init__(self, values=(), *, outcomes=()):
+        super().__init__(values)
+        self.outcomes = tuple(outcomes)
+
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -22304,6 +22319,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
         if not getattr(self.config, "stt_enabled", True):
+            unavailable_results = _TranscriptionResults(
+                outcomes=[None] * len(audio_paths),
+            )
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
@@ -22315,14 +22333,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 else:
                     notes.append(f"[The user sent a voice message: {abs_path}]")
             if not notes:
-                return user_text, []
+                return user_text, unavailable_results
             prefix = "\n\n".join(notes)
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return prefix, []
+                return prefix, unavailable_results
             if user_text:
-                return f"{prefix}\n\n{user_text}", []
-            return prefix, []
+                return f"{prefix}\n\n{user_text}", unavailable_results
+            return prefix, unavailable_results
 
         try:
             from tools.transcription_tools import (
@@ -22331,17 +22349,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except ModuleNotFoundError as e:
             logger.error("Transcription module unavailable: %s", e)
+            unavailable_results = _TranscriptionResults(
+                outcomes=[None] * len(audio_paths),
+            )
             unavailable_note = "[voice message could not be transcribed]"
             _placeholder = "(The user sent a message with no text content)"
             if user_text and user_text.strip() == _placeholder:
-                return unavailable_note, []
+                return unavailable_note, unavailable_results
             if user_text:
-                return f"{unavailable_note}\n\n{user_text}", []
-            return unavailable_note, []
+                return f"{unavailable_note}\n\n{user_text}", unavailable_results
+            return unavailable_note, unavailable_results
 
         enriched_parts = []
-        successful_transcripts: List[str] = []
+        successful_values: List[str] = []
+        transcription_outcomes: List[Optional[str]] = []
         for path in audio_paths:
+            transcript_outcome = None
             try:
                 logger.debug("Transcribing one private user voice attachment")
                 result = await asyncio.to_thread(transcribe_audio, path)
@@ -22368,7 +22391,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "to resend or type it out.]"
                         )
                         continue
-                    successful_transcripts.append(transcript)
+                    successful_values.append(transcript)
+                    transcript_outcome = transcript
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
@@ -22402,6 +22426,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "[voice message could not be transcribed automatically; "
                     f"the audio is available at: {agent_path}]"
                 )
+            finally:
+                transcription_outcomes.append(transcript_outcome)
+
+        successful_transcripts = _TranscriptionResults(
+            successful_values,
+            outcomes=transcription_outcomes,
+        )
 
         if enriched_parts:
             prefix = "\n\n".join(enriched_parts)
@@ -22439,7 +22470,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if hasattr(event, "_gateway_pending_stt_text"):
             cached_text = getattr(event, "_gateway_pending_stt_text")
             cached_transcripts = getattr(event, "_gateway_pending_stt_transcripts", []) or []
-            return cached_text, list(cached_transcripts)
+            cached_outcomes = getattr(event, "_gateway_pending_stt_outcomes", []) or []
+            return cached_text, _TranscriptionResults(
+                cached_transcripts,
+                outcomes=cached_outcomes,
+            )
 
         audio_paths = self._pending_event_audio_paths(event)
         if not audio_paths:
@@ -22452,6 +22487,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         setattr(event, "_gateway_pending_stt_text", enriched_text)
         setattr(event, "_gateway_pending_stt_transcripts", list(successful_transcripts))
+        setattr(
+            event,
+            "_gateway_pending_stt_outcomes",
+            list(getattr(successful_transcripts, "outcomes", ())),
+        )
         return enriched_text, successful_transcripts
 
     @staticmethod
@@ -22486,32 +22526,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
 
         new_cards = []
-        for index, transcript in enumerate(transcripts):
-            source_ref = (
-                source_refs[index] if index < len(source_refs) else fallback_source_ref
-            )
-            if source_ref:
-                new_cards.append(
-                    build_voice_note_intake_card(
-                        transcript,
-                        source_ref=str(source_ref),
-                        ordinal=index,
-                    )
+        aligned_outcomes = getattr(transcripts, "outcomes", None)
+        if isinstance(aligned_outcomes, (list, tuple)):
+            for ordinal, outcome in enumerate(aligned_outcomes):
+                source_ref = (
+                    source_refs[ordinal]
+                    if ordinal < len(source_refs)
+                    else fallback_source_ref
                 )
-        for blocked_index in range(max(0, int(blocked_count))):
-            ordinal = len(transcripts) + blocked_index
-            source_ref = (
-                source_refs[ordinal]
-                if ordinal < len(source_refs)
-                else fallback_source_ref
-            )
-            if source_ref:
-                new_cards.append(
-                    build_voice_note_blocked_card(
-                        source_ref=str(source_ref),
-                        ordinal=ordinal,
+                if not source_ref:
+                    continue
+                if isinstance(outcome, str) and outcome.strip():
+                    new_cards.append(
+                        build_voice_note_intake_card(
+                            outcome,
+                            source_ref=str(source_ref),
+                            ordinal=ordinal,
+                        )
                     )
+                else:
+                    new_cards.append(
+                        build_voice_note_blocked_card(
+                            source_ref=str(source_ref),
+                            ordinal=ordinal,
+                        )
+                    )
+        else:
+            # Compatibility for isolated callers/tests that pass a plain list:
+            # successes precede the reported blocked tail, matching the legacy
+            # behavior before per-input outcomes were retained.
+            for index, transcript in enumerate(transcripts):
+                source_ref = (
+                    source_refs[index]
+                    if index < len(source_refs)
+                    else fallback_source_ref
                 )
+                if source_ref:
+                    new_cards.append(
+                        build_voice_note_intake_card(
+                            transcript,
+                            source_ref=str(source_ref),
+                            ordinal=index,
+                        )
+                    )
+            for blocked_index in range(max(0, int(blocked_count))):
+                ordinal = len(transcripts) + blocked_index
+                source_ref = (
+                    source_refs[ordinal]
+                    if ordinal < len(source_refs)
+                    else fallback_source_ref
+                )
+                if source_ref:
+                    new_cards.append(
+                        build_voice_note_blocked_card(
+                            source_ref=str(source_ref),
+                            ordinal=ordinal,
+                        )
+                    )
         for card in new_cards:
             if card.state_ref not in existing_refs:
                 raw_cards.append(card.to_mapping())
