@@ -157,6 +157,7 @@ from gateway.platforms.helpers import (
 from utils import atomic_json_write, env_float, env_int
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    InboundMediaTooLargeError,
     MessageEvent,
     MessageType,
     ProcessingOutcome,
@@ -8383,7 +8384,8 @@ class DiscordAdapter(BasePlatformAdapter):
         if resolved_reference is not None:
             referenced_attachments = list(getattr(resolved_reference, "attachments", []) or [])
 
-        all_attachments = list(message.attachments) + snapshot_attachments + referenced_attachments
+        direct_attachments = list(message.attachments) + snapshot_attachments
+        all_attachments = direct_attachments + referenced_attachments
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -8462,8 +8464,11 @@ class DiscordAdapter(BasePlatformAdapter):
         media_urls = []
         media_types = []
         intake_cards = []
+        stt_media_indexes = []
+        voice_intake_source_refs = []
         pending_text_injection: Optional[str] = None
         for attachment_index, att in enumerate(all_attachments):
+            is_direct_attachment = attachment_index < len(direct_attachments)
             content_type = att.content_type or "unknown"
             filename = getattr(att, "filename", None) or "attachment"
             declared_size = getattr(att, "size", None)
@@ -8478,6 +8483,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 return min(positive) if positive else 0
 
             def _attachment_card(status: str, *, limit_bytes: int = 0) -> None:
+                if not is_direct_attachment:
+                    return
                 intake_cards.append(
                     build_attachment_intake_card(
                         filename=filename,
@@ -8509,7 +8516,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     _attachment_card("ready", limit_bytes=media_limit)
                     logger.info("[Discord] Cached one user image privately")
                 except Exception as e:
-                    _attachment_card("download_failed", limit_bytes=media_limit)
+                    status = (
+                        "oversized"
+                        if isinstance(e, InboundMediaTooLargeError)
+                        else "download_failed"
+                    )
+                    _attachment_card(status, limit_bytes=media_limit)
                     logger.warning(
                         "[Discord] Failed to cache image attachment (%s)",
                         type(e).__name__,
@@ -8525,13 +8537,24 @@ class DiscordAdapter(BasePlatformAdapter):
                     if ext not in {".ogg", ".mp3", ".wav", ".webm", ".m4a"}:
                         ext = ".ogg"
                     cached_path = await self._cache_discord_audio(att, ext)
+                    media_index = len(media_urls)
                     media_urls.append(cached_path)
                     media_types.append(content_type)
+                    if is_native_voice_note:
+                        stt_media_indexes.append(media_index)
+                        voice_intake_source_refs.append(
+                            source_ref if is_direct_attachment else None
+                        )
                     if not is_native_voice_note:
                         _attachment_card("ready", limit_bytes=media_limit)
                     logger.info("[Discord] Cached one user audio attachment privately")
                 except Exception as e:
-                    _attachment_card("download_failed", limit_bytes=media_limit)
+                    status = (
+                        "oversized"
+                        if isinstance(e, InboundMediaTooLargeError)
+                        else "download_failed"
+                    )
+                    _attachment_card(status, limit_bytes=media_limit)
                     logger.warning(
                         "[Discord] Failed to cache audio attachment (%s)",
                         type(e).__name__,
@@ -8562,6 +8585,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 else:
                     try:
                         raw_bytes = await self._cache_discord_document(att, ext)
+                        validate_inbound_media_size(
+                            len(raw_bytes),
+                            media_type="attachment",
+                            max_bytes=max_doc_bytes,
+                        )
                         if not raw_bytes:
                             _attachment_card("unreadable", limit_bytes=max_doc_bytes)
                             continue
@@ -8620,7 +8648,12 @@ class DiscordAdapter(BasePlatformAdapter):
                         # ``to_agent_visible_cache_path()`` (important for
                         # Docker/Modal terminal backends).
                     except Exception as e:
-                        _attachment_card("download_failed", limit_bytes=max_doc_bytes)
+                        status = (
+                            "oversized"
+                            if isinstance(e, InboundMediaTooLargeError)
+                            else "download_failed"
+                        )
+                        _attachment_card(status, limit_bytes=max_doc_bytes)
                         logger.warning(
                             "[Discord] Failed to cache attachment (%s)",
                             type(e).__name__,
@@ -8739,6 +8772,12 @@ class DiscordAdapter(BasePlatformAdapter):
             if message.reference.resolved:
                 reply_to_text = getattr(message.reference.resolved, "content", None) or None
 
+        event_metadata = {"stt_media_indexes": stt_media_indexes}
+        if intake_cards:
+            event_metadata["intake_cards"] = intake_cards
+        if voice_intake_source_refs:
+            event_metadata["voice_intake_source_refs"] = voice_intake_source_refs
+
         event = MessageEvent(
             text=event_text,
             message_type=msg_type,
@@ -8753,7 +8792,7 @@ class DiscordAdapter(BasePlatformAdapter):
             auto_skill=_skills,
             channel_prompt=_channel_prompt,
             channel_context=_channel_context,
-            metadata={"intake_cards": intake_cards} if intake_cards else {},
+            metadata=event_metadata,
         )
 
         # Track thread participation so the bot won't require @mention for
