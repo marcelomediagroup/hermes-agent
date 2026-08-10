@@ -1282,7 +1282,10 @@ class GatewayStreamConsumer:
                 chat_id=self.chat_id,
                 content=text,
                 reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=True),
+                metadata=self._metadata_for_send(
+                    final=final,
+                    expect_edits=not final,
+                ),
             )
             if result.success and result.message_id:
                 self._message_id = str(result.message_id)
@@ -2458,7 +2461,7 @@ class GatewayStreamConsumer:
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
                         final=finalize and is_turn_final,
-                        expect_edits=True,
+                        expect_edits=not (finalize and is_turn_final),
                     ),
                 )
                 if result.success:
