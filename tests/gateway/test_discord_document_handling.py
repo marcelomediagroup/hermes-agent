@@ -58,6 +58,7 @@ def _ensure_discord_mock():
 _ensure_discord_mock()
 
 import plugins.platforms.discord.adapter as discord_platform  # noqa: E402
+from gateway.operator_cards import OperatorCard  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
@@ -181,6 +182,13 @@ class TestIncomingDocumentHandling:
         assert "summarize this" in event.text
         # injection prepended before caption
         assert event.text.index("[Content of") < event.text.index("summarize this")
+        cards = [OperatorCard.from_mapping(raw) for raw in event.metadata["intake_cards"]]
+        assert [card.title for card in cards] == ["Attachment ready"]
+        assert [action.id for action in cards[0].actions] == [
+            "summarize",
+            "extract_tasks",
+            "create_oe_task",
+        ]
 
     @pytest.mark.asyncio
     async def test_md_content_injected(self, adapter):
@@ -283,6 +291,22 @@ class TestIncomingDocumentHandling:
         assert "Second file content" in event.text
         assert event.text.index("file1") < event.text.index("file2")
 
+    @pytest.mark.asyncio
+    async def test_native_voice_note_defers_to_transcript_intake_card(self, adapter):
+        attachment = make_attachment(
+            filename="voice-message.ogg",
+            content_type="audio/ogg",
+        )
+        attachment.is_voice_message = True
+        adapter._cache_discord_audio = AsyncMock(return_value="/tmp/private-voice.ogg")
+
+        await adapter._handle_message(make_message([attachment]))
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.message_type == MessageType.VOICE
+        assert event.media_urls == ["/tmp/private-voice.ogg"]
+        assert event.metadata.get("intake_cards") is None
+
 
 class TestAllowAnyAttachment:
     """Cover accept-any-file-type inbound handling.
@@ -330,6 +354,54 @@ class TestAllowAnyAttachment:
 
         event = adapter.handle_message.call_args[0][0]
         assert event.media_urls == []
+        card = OperatorCard.from_mapping(event.metadata["intake_cards"][0])
+        fields = {field.label: field.value for field in card.fields}
+        assert card.title == "Attachment blocked"
+        assert card.actions == ()
+        assert "configured limit" in fields["Reason"]
+        assert fields["Limit"] == "1 KiB"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_text_file_gets_recovery_card_without_media(self, adapter):
+        with _mock_aiohttp_download(b"\xff\xfe\xfd"):
+            msg = make_message([
+                make_attachment(filename="broken.txt", content_type="text/plain")
+            ])
+            await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        card = OperatorCard.from_mapping(event.metadata["intake_cards"][0])
+        assert event.media_urls == []
+        assert card.title == "Attachment blocked"
+        assert "could not be read" in {
+            field.label: field.value for field in card.fields
+        }["Reason"]
+
+    @pytest.mark.asyncio
+    async def test_download_failure_gets_content_free_recovery_card(
+        self,
+        adapter,
+        caplog,
+    ):
+        msg = make_message([
+            make_attachment(filename="private.pdf", content_type="application/pdf")
+        ])
+        adapter._cache_discord_document = AsyncMock(
+            side_effect=RuntimeError("private signed URL must not leak")
+        )
+
+        await adapter._handle_message(msg)
+
+        event = adapter.handle_message.call_args[0][0]
+        card_mapping = event.metadata["intake_cards"][0]
+        card = OperatorCard.from_mapping(card_mapping)
+        assert event.media_urls == []
+        assert card.title == "Attachment blocked"
+        assert "private signed URL" not in str(card_mapping)
+        assert "private signed URL" not in caplog.text
+        assert "could not be downloaded" in {
+            field.label: field.value for field in card.fields
+        }["Reason"]
 
     @pytest.mark.asyncio
     async def test_max_attachment_bytes_zero_means_unlimited(self, adapter):
@@ -349,5 +421,3 @@ class TestAllowAnyAttachment:
 
         event = adapter.handle_message.call_args[0][0]
         assert len(event.media_urls) == 1
-
-
