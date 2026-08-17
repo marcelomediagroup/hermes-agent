@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -204,8 +205,9 @@ def spawn_async_diagnostic(
 
     Runs as a detached subprocess so it can't block the asyncio event loop
     or compete with platform teardown.  The subprocess uses its own
-    ``timeout`` so a wedged ``ps`` still self-cleans within
-    ``timeout_seconds``.
+    ``timeout`` (or Homebrew's ``gtimeout``) when available so a wedged ``ps``
+    self-cleans within ``timeout_seconds``.  On stock macOS, where neither
+    command exists, it still emits the best-effort diagnostic directly.
 
     Returns the subprocess PID on success, ``None`` on failure.  Never
     raises.
@@ -254,8 +256,12 @@ def spawn_async_diagnostic(
         # would also reap us anyway, but defense in depth).  Without
         # start_new_session, a SIGKILL on our cgroup takes the diag down
         # before it can flush.
+        timeout_bin = shutil.which("timeout") or shutil.which("gtimeout")
+        command = ["bash", "-c", script]
+        if timeout_bin is not None:
+            command = [timeout_bin, f"{timeout_seconds:.0f}", *command]
         proc = subprocess.Popen(
-            ["timeout", f"{timeout_seconds:.0f}", "bash", "-c", script],
+            command,
             stdout=fd,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
