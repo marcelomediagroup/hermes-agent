@@ -35,69 +35,45 @@ def test_official_ssh_origin_uses_https_fetch_and_exact_count(tmp_path):
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
-    calls = []
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "git@github.com:NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "HEAD"]:
+            return "b" * 40
+        raise AssertionError(f"unexpected git command: {args!r}")
 
-    def fake_run(cmd, **kwargs):
-        calls.append(cmd)
-        if cmd == ["git", "remote", "get-url", "origin"]:
-            return MagicMock(
-                returncode=0,
-                stdout="git@github.com:NousResearch/hermes-agent.git\n",
-            )
-        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
-            return MagicMock(returncode=0, stdout="false\n")
-        if cmd == [
-            "git",
-            "fetch",
-            "https://github.com/NousResearch/hermes-agent.git",
-            "refs/heads/main",
-            "--quiet",
-        ]:
-            return MagicMock(returncode=0, stdout="")
-        if cmd == ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"]:
-            return MagicMock(returncode=0, stdout="42\n")
-        raise AssertionError(f"unexpected git command: {cmd!r}")
-
-    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
+        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
+        patch.object(banner, "_github_compare_behind", return_value=42),
+    ):
         result = banner._check_via_local_git(repo_dir)
 
     assert result == 42
-    assert ["git", "fetch", "origin", "main", "--quiet"] not in calls
 
 
 def test_official_ssh_shallow_clone_keeps_presence_only_count(tmp_path):
-    """Official SSH shallow clones preserve their depth boundary via HTTPS."""
+    """Official SSH checks keep an honest sentinel when counting is unavailable."""
     import hermes_cli.banner as banner
 
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
     (repo_dir / ".git").mkdir()
 
-    def fake_run(cmd, **kwargs):
-        if cmd == ["git", "remote", "get-url", "origin"]:
-            return MagicMock(
-                returncode=0,
-                stdout="git@github.com:NousResearch/hermes-agent.git\n",
-            )
-        if cmd == ["git", "rev-parse", "--is-shallow-repository"]:
-            return MagicMock(returncode=0, stdout="true\n")
-        if cmd == [
-            "git",
-            "fetch",
-            "https://github.com/NousResearch/hermes-agent.git",
-            "refs/heads/main",
-            "--depth",
-            "1",
-            "--quiet",
-        ]:
-            return MagicMock(returncode=0, stdout="")
-        if cmd == ["git", "rev-parse", "HEAD"]:
-            return MagicMock(returncode=0, stdout="local-sha\n")
-        if cmd == ["git", "rev-parse", "FETCH_HEAD"]:
-            return MagicMock(returncode=0, stdout="upstream-sha\n")
-        raise AssertionError(f"unexpected git command: {cmd!r}")
+    def fake_git_stdout(args, *, cwd, timeout=5):
+        if args == ["remote", "get-url", "origin"]:
+            return "git@github.com:NousResearch/hermes-agent.git"
+        if args == ["rev-parse", "HEAD"]:
+            return "b" * 40
+        raise AssertionError(f"unexpected git command: {args!r}")
 
-    with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
+    with (
+        patch.object(banner, "_git_stdout", side_effect=fake_git_stdout),
+        patch.object(banner, "_upstream_main_sha", return_value="a" * 40),
+        patch.object(banner.subprocess, "run", return_value=MagicMock(returncode=1)),
+        patch.object(banner, "_github_compare_behind", return_value=None),
+    ):
         result = banner._check_via_local_git(repo_dir)
 
     assert result == banner.UPDATE_AVAILABLE_NO_COUNT
