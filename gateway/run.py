@@ -22658,6 +22658,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         stream_consumer=None,
     ) -> None:
         """Deliver a queued response using the normal text+attachment split."""
+        notification_delivered = text_already_delivered
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:
@@ -22685,6 +22686,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
+                            notification_delivered = True
                             logger.info(
                                 "Queued-lane final reconciled by editing message %s in place (no duplicate send).",
                                 _sc_msg_id,
@@ -22700,6 +22702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         text_content,
                         metadata=metadata,
                     )
+                    notification_delivered = True
 
         # Failed turns still deliver their (normalized failure) text above,
         # but must not upload attachments as if the turn succeeded — mirrors
@@ -22713,11 +22716,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             source=source,
             message_id=event_message_id,
         )
+        media_metadata = dict(metadata or {})
+        if notification_delivered:
+            # The text already carried the one turn-final notification. Keep
+            # its explicit attachments in-thread without a second requester
+            # mention/push notification.
+            media_metadata.pop("notify", None)
         await self._deliver_media_from_response(
             response,
             synthetic_event,
             adapter,
-            thread_metadata=metadata,
+            thread_metadata=media_metadata or None,
         )
 
     async def _run_background_task(

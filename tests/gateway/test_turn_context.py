@@ -104,6 +104,11 @@ class TestTurnRunner:
         gateway_runner.session_store._entries = {}
         gateway_runner._get_system_prompt_for_channel.return_value = None
         gateway_runner._resolve_session_agent_runtime.return_value = ("test-model", {})
+        gateway_runner._resolve_dynamic_channel_route.return_value = (
+            "test-model",
+            {},
+            None,
+        )
         gateway_runner._resolve_session_reasoning_config.return_value = None
         gateway_runner._resolve_session_service_tier.return_value = None
         gateway_runner._resolve_turn_agent_config.return_value = {

@@ -341,7 +341,7 @@ async def test_document_first_mixed_media_still_transcribes_native_voice():
             history=[],
         )
 
-    transcribe.assert_called_once_with("/private/cache/voice.ogg")
+    transcribe.assert_called_once_with("/private/cache/voice.ogg", None, "gateway")
     assert "voice after pdf" in result
     card = OperatorCard.from_mapping(
         adapter.send.await_args_list[-1].kwargs["metadata"]["operator_card"]

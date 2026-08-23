@@ -442,6 +442,7 @@ class GatewayStreamConsumer:
         content: str,
         finalize: bool = False,
         notify: bool = False,
+        expect_edits: Optional[bool] = None,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
         kwargs: dict[str, Any] = {
@@ -462,7 +463,9 @@ class GatewayStreamConsumer:
                 ):
                     kwargs["metadata"] = self._metadata_for_send(
                         final=notify,
-                        expect_edits=not finalize,
+                        expect_edits=(
+                            not finalize if expect_edits is None else expect_edits
+                        ),
                     )
             except (TypeError, ValueError):
                 pass
@@ -2578,6 +2581,9 @@ class GatewayStreamConsumer:
                         content=text,
                         finalize=finalize,
                         notify=finalize and is_turn_final,
+                        # A finalized preamble is still editable when it is
+                        # not the turn-final notification.
+                        expect_edits=not (finalize and is_turn_final),
                     )
                     if result.success:
                         self._already_sent = True
@@ -2756,7 +2762,7 @@ class GatewayStreamConsumer:
                     reply_to=self._initial_reply_to_id,
                     metadata=self._metadata_for_send(
                         final=finalize and is_turn_final,
-                        expect_edits=not finalize,
+                        expect_edits=not (finalize and is_turn_final),
                     ),
                 )
                 if result.success:
