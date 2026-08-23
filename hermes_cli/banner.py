@@ -397,6 +397,19 @@ def check_for_updates() -> Optional[int]:
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
 
+    # A source checkout can move to a different commit without changing the
+    # packaged version (for example after rebasing locally carried commits).
+    # Include that commit in the cache identity so a stale "update available"
+    # result cannot survive a successful source update.
+    repo_dir: Optional[Path] = None
+    local_rev: Optional[str] = None
+    if not embedded_rev:
+        repo_dir = Path(__file__).parent.parent.resolve()
+        if not (repo_dir / ".git").exists():
+            repo_dir = hermes_home / "hermes-agent"
+        if (repo_dir / ".git").exists():
+            local_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
+
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
     # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
@@ -421,6 +434,7 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("local_rev") == local_rev
             ):
                 return cached.get("behind")
     except Exception:
@@ -429,12 +443,9 @@ def check_for_updates() -> Optional[int]:
     if embedded_rev:
         behind = _check_via_rev(embedded_rev)
     else:
-        # Prefer the running code's location over the profile-scoped path.
-        # $HERMES_HOME/hermes-agent/ may be a stale copy from --clone-all;
-        # Path(__file__) always resolves to the actual installed checkout.
-        repo_dir = Path(__file__).parent.parent.resolve()
-        if not (repo_dir / ".git").exists():
-            repo_dir = hermes_home / "hermes-agent"
+        # repo_dir was resolved before the cache check so the source commit is
+        # part of the cache identity.
+        assert repo_dir is not None
         if not (repo_dir / ".git").exists():
             # No git checkout and no embedded revision — can't determine
             # update status. This is the Docker path (already short-circuited
@@ -445,7 +456,13 @@ def check_for_updates() -> Optional[int]:
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION}),
+            json.dumps({
+                "ts": now,
+                "behind": behind,
+                "rev": embedded_rev,
+                "ver": VERSION,
+                "local_rev": local_rev,
+            }),
             encoding="utf-8",
         )
     except Exception:

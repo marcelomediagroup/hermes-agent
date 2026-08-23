@@ -7,9 +7,9 @@ from unittest.mock import MagicMock, patch
 
 
 def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
-    """A fresh cache should avoid any git subprocess."""
+    """A fresh cache for the current source revision avoids network work."""
     from hermes_cli import __version__
-    from hermes_cli.banner import check_for_updates
+    import hermes_cli.banner as banner
 
     repo_dir = tmp_path / "hermes-agent"
     repo_dir.mkdir()
@@ -17,15 +17,54 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
 
     cache_file = tmp_path / ".update_check"
     cache_file.write_text(
-        json.dumps({"ts": time.time(), "behind": 3, "ver": __version__})
+        json.dumps({
+            "ts": time.time(),
+            "behind": 3,
+            "ver": __version__,
+            "local_rev": "a" * 40,
+        })
     )
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    with patch("hermes_cli.banner.subprocess.run") as mock_run:
-        result = check_for_updates()
+    with (
+        patch.object(banner, "__file__", str(repo_dir / "hermes_cli" / "banner.py")),
+        patch.object(banner, "_git_stdout", return_value="a" * 40) as mock_git,
+        patch.object(banner, "_check_via_local_git") as mock_check,
+    ):
+        result = banner.check_for_updates()
 
     assert result == 3
-    mock_run.assert_not_called()
+    mock_git.assert_called_once_with(["rev-parse", "HEAD"], cwd=repo_dir)
+    mock_check.assert_not_called()
+
+
+def test_check_for_updates_invalidates_cache_when_source_revision_changes(tmp_path, monkeypatch):
+    """A rebase at the same package version must not reuse stale update status."""
+    from hermes_cli import __version__
+    import hermes_cli.banner as banner
+
+    repo_dir = tmp_path / "hermes-agent"
+    repo_dir.mkdir()
+    (repo_dir / ".git").mkdir()
+    cache_file = tmp_path / ".update_check"
+    cache_file.write_text(json.dumps({
+        "ts": time.time(),
+        "behind": -1,
+        "ver": __version__,
+        "local_rev": "a" * 40,
+    }))
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    with (
+        patch.object(banner, "__file__", str(repo_dir / "hermes_cli" / "banner.py")),
+        patch.object(banner, "_git_stdout", return_value="b" * 40),
+        patch.object(banner, "_check_via_local_git", return_value=0) as mock_check,
+    ):
+        result = banner.check_for_updates()
+
+    assert result == 0
+    mock_check.assert_called_once_with(repo_dir)
+    assert json.loads(cache_file.read_text())["local_rev"] == "b" * 40
 
 
 def test_official_ssh_origin_uses_https_fetch_and_exact_count(tmp_path):
