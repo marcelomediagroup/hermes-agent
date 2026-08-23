@@ -1,7 +1,7 @@
 # OE-176 Media and Operations Discord Digests Receipt
 
-Date: 2026-08-10  
-Issue: OE-176  
+Date: 2026-08-10
+Issue: OE-176
 Dependency: OE-408 was already in Agent Done with its authenticated operator-card contract accepted before this implementation began.
 
 ## Result
