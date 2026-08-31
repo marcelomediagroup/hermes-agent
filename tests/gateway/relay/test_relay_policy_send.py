@@ -92,7 +92,7 @@ def test_threaded_scopes_keep_default_mention_gate(monkeypatch):
     assert pol["freeResponseScopes"] == ["c-intake"]
 
 
-def test_projection_uses_env_only_scopes_with_normalization(monkeypatch):
+def test_projection_uses_only_legacy_env_free_response_scopes(monkeypatch):
     monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
     monkeypatch.setenv(
         "DISCORD_FREE_RESPONSE_CHANNELS",
@@ -107,7 +107,27 @@ def test_projection_uses_env_only_scopes_with_normalization(monkeypatch):
 
     assert pol is not None
     assert pol["requireAddress"] is True
-    assert pol["freeResponseScopes"] == ["c-chat", "c-shared", "c-intake"]
+    assert pol["freeResponseScopes"] == ["c-chat", "c-shared"]
+
+
+def test_projection_does_not_borrow_default_profile_env_under_multiplex(
+    monkeypatch,
+):
+    from agent import secret_scope
+
+    monkeypatch.setenv("GATEWAY_RELAY_PLATFORMS", "discord")
+    monkeypatch.setenv("DISCORD_FREE_RESPONSE_CHANNELS", "default-profile")
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "all")
+    previous_multiplex = secret_scope.is_multiplex_active()
+    scope_token = secret_scope.set_secret_scope({})
+    secret_scope.set_multiplex_active(True)
+    try:
+        pol = relay.relay_relevance_policy()
+    finally:
+        secret_scope.reset_secret_scope(scope_token)
+        secret_scope.set_multiplex_active(previous_multiplex)
+
+    assert pol is None
 
 
 def test_projection_preserves_scalar_channel_id(monkeypatch):

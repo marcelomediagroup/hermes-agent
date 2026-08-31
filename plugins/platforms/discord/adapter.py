@@ -434,7 +434,6 @@ _GATE_ENV_KEYS = (
     "DISCORD_IGNORED_CHANNELS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
-    "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
     "DISCORD_AUTO_THREAD",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
@@ -6765,13 +6764,14 @@ class DiscordAdapter(BasePlatformAdapter):
         return set()
 
     def _discord_threaded_free_response_channels(self) -> set:
-        """Return mention-free channels that should still auto-thread."""
-        return self._gate_csv_set(
-            self._gate_raw(
-                "threaded_free_response_channels",
-                "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
-            )
+        """Return config-owned mention-free channels that still auto-thread."""
+        extra = getattr(getattr(self, "config", None), "extra", None)
+        raw = (
+            extra.get("threaded_free_response_channels")
+            if isinstance(extra, dict)
+            else None
         )
+        return self._gate_csv_set(raw)
 
     def _discord_auto_thread_enabled(self) -> bool:
         """Resolve auto-threading from this adapter's profile configuration.
@@ -10515,23 +10515,29 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     )
     if approval_mentions_cfg is not None and not os.getenv("DISCORD_APPROVAL_MENTIONS"):
         os.environ["DISCORD_APPROVAL_MENTIONS"] = str(approval_mentions_cfg).lower()
-    frc = discord_cfg.get("free_response_channels")
-    if frc is not None:
-        if isinstance(frc, list):
-            frc = ",".join(str(v) for v in frc)
-        seeded_extra["free_response_channels"] = str(frc)
-        if not _skip_env_bridge and not os.getenv("DISCORD_FREE_RESPONSE_CHANNELS"):
-            os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
-    tfrc = discord_cfg.get("threaded_free_response_channels")
-    if tfrc is not None:
-        if isinstance(tfrc, list):
-            tfrc = ",".join(str(v) for v in tfrc)
-        seeded_extra["threaded_free_response_channels"] = str(tfrc)
+    def _seed_channel_scopes(
+        config_key: str,
+        legacy_env_key: str | None = None,
+    ) -> None:
+        configured_scopes = discord_cfg.get(config_key)
+        if configured_scopes is None:
+            return
+        if isinstance(configured_scopes, list):
+            configured_scopes = ",".join(str(value) for value in configured_scopes)
+        normalized_scopes = str(configured_scopes)
+        seeded_extra[config_key] = normalized_scopes
         if (
-            not _skip_env_bridge
-            and not os.getenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS")
+            legacy_env_key
+            and not _skip_env_bridge
+            and not os.getenv(legacy_env_key)
         ):
-            os.environ["DISCORD_THREADED_FREE_RESPONSE_CHANNELS"] = str(tfrc)
+            os.environ[legacy_env_key] = normalized_scopes
+
+    _seed_channel_scopes(
+        "free_response_channels",
+        "DISCORD_FREE_RESPONSE_CHANNELS",
+    )
+    _seed_channel_scopes("threaded_free_response_channels")
     if "auto_thread" in discord_cfg:
         seeded_extra["auto_thread"] = discord_cfg["auto_thread"]
         if not _skip_env_bridge and not os.getenv("DISCORD_AUTO_THREAD"):

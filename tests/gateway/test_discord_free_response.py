@@ -111,7 +111,6 @@ def adapter(monkeypatch):
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
         "DISCORD_FREE_RESPONSE_CHANNELS",
-        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS",
         "DISCORD_AUTO_THREAD",
         "DISCORD_NO_THREAD_CHANNELS",
         "DISCORD_ALLOWED_CHANNELS",
@@ -445,20 +444,30 @@ async def test_no_thread_channel_overrides_threaded_free_response(
     assert event.source.chat_type == "group"
 
 
-def test_discord_threaded_free_response_yaml_bridge(monkeypatch):
-    monkeypatch.delenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", raising=False)
-
-    seeded = discord_platform._apply_yaml_config(
-        {}, {"threaded_free_response_channels": ["789", "790"]}
+def test_discord_threaded_free_response_config_loads_end_to_end(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / "hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "discord:\n"
+        "  enabled: true\n"
+        "  threaded_free_response_channels:\n"
+        "    - '789'\n"
+        "    - '790'\n",
+        encoding="utf-8",
     )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("DISCORD_THREADED_FREE_RESPONSE_CHANNELS", "999")
 
-    assert seeded is not None
-    assert seeded["threaded_free_response_channels"] == "789,790"
-    assert discord_platform.os.getenv(
-        "DISCORD_THREADED_FREE_RESPONSE_CHANNELS"
-    ) == "789,790"
-    bridged_adapter = DiscordAdapter(PlatformConfig(enabled=True, token="fake-token"))
-    assert bridged_adapter._discord_threaded_free_response_channels() == {
+    from gateway.config import load_gateway_config
+
+    loaded = load_gateway_config()
+    discord_config = loaded.platforms[Platform.DISCORD]
+    loaded_adapter = DiscordAdapter(discord_config)
+
+    assert discord_config.extra["threaded_free_response_channels"] == "789,790"
+    assert loaded_adapter._discord_threaded_free_response_channels() == {
         "789",
         "790",
     }

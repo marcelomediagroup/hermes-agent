@@ -384,8 +384,9 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
         (whether bot-authored messages are admitted; default off).
 
     Read from the relay platform's config block (the platform the connector
-    fronts, e.g. ``discord:``), falling back to the bridged top-level keys, then
-    the ``{PLATFORM}_*`` env when neither YAML location declares the key.
+    fronts, e.g. ``discord:``), falling back to the bridged top-level keys.
+    The legacy ``free_response_channels`` environment spelling remains a
+    scope-aware fallback; ``threaded_free_response_channels`` is config-only.
     ``platform`` defaults to the PRIMARY fronted platform (back-compat).
     Returns the generic dict, or None when relay isn't
     configured or the platform exposes no relevance knobs (⇒ the connector's
@@ -421,6 +422,8 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
         elif cfg.get("require_mention") is not None:
             require_mention = cfg.get("require_mention")
 
+        from gateway.authz_mixin import _platform_gate_env
+
         for config_key in (
             "free_response_channels",
             "threaded_free_response_channels",
@@ -429,9 +432,12 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
                 configured_scopes = plat_cfg.get(config_key)
             elif config_key in cfg:
                 configured_scopes = cfg.get(config_key)
+            elif config_key == "free_response_channels":
+                configured_scopes = _platform_gate_env(
+                    f"{platform.upper()}_FREE_RESPONSE_CHANNELS"
+                )
             else:
-                env_key = f"{platform.upper()}_{config_key.upper()}"
-                configured_scopes = os.environ.get(env_key)
+                configured_scopes = None
             for scope in _normalize_relay_scopes(configured_scopes):
                 if scope not in free_response:
                     free_response.append(scope)
@@ -440,7 +446,10 @@ def relay_relevance_policy(platform: Optional[str] = None) -> Optional[dict]:
 
     # allow_other_bots ← {PLATFORM}_ALLOW_BOTS in {"mentions","all"} (same gate as
     # the gateway's own authz_mixin DISCORD_ALLOW_BOTS bypass).
-    allow_bots_env = os.environ.get(f"{platform.upper()}_ALLOW_BOTS", "").lower().strip()
+    from gateway.authz_mixin import _platform_gate_env
+
+    allow_bots_env = _platform_gate_env(f"{platform.upper()}_ALLOW_BOTS")
+    allow_bots_env = allow_bots_env.lower().strip()
     allow_other_bots = allow_bots_env in {"mentions", "all"}
 
     # Nothing CONFIGURED to declare ⇒ let the connector keep its default policy
