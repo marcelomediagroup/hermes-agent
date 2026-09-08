@@ -20,6 +20,20 @@ from agent.message_metadata import append_message
 
 logger = logging.getLogger("agent.conversation_loop")
 
+_REQUIRED_CHILD_NOTE = (
+    "Task not complete: required background work or its results are still pending. "
+    "This turn is paused for asynchronous delivery."
+)
+
+
+def required_child_completion_note(agent, response):
+    """Qualify text without retrying the model or withholding blockers/questions."""
+    from tools.async_delegation import pending_required_delegations
+    pending = pending_required_delegations(getattr(agent, "session_id", None), getattr(agent, "_session_db", None))
+    if pending and not (response or "").endswith(_REQUIRED_CHILD_NOTE):
+        response = ((response or "").rstrip() + "\n\n" + _REQUIRED_CHILD_NOTE).lstrip()
+    return response, pending
+
 
 @dataclass
 class StopGateVerdict:

@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional
 
 from agent.message_metadata import append_message
 from agent.turn_empty_response import recover_empty_response
-from agent.turn_stop_gates import apply_stop_gates
+from agent.turn_stop_gates import apply_stop_gates, required_child_completion_note
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -211,6 +211,11 @@ def finish_text_response(
     ):
         messages.pop()
 
+    # Qualify before verification retains a candidate as its budget fallback.
+    final_response, pending_children = required_child_completion_note(agent, final_response)
+    if pending_children:
+        final_msg["content"] = final_response
+        final_msg["finish_reason"] = "waiting_for_required_children"
     _sg = apply_stop_gates(
         agent, final_msg, final_response=final_response, messages=messages,
         conversation_history=conversation_history,
@@ -236,7 +241,7 @@ def finish_text_response(
             exc_info=True,
         )
 
-    _turn_exit_reason = f"text_response(finish_reason={finish_reason})"
-    if not agent.quiet_mode:
+    _turn_exit_reason = "waiting_for_required_children" if pending_children else f"text_response(finish_reason={finish_reason})"
+    if not agent.quiet_mode and not pending_children:
         agent._safe_print(f"🎉 Conversation completed after {api_call_count} OpenAI-compatible API call(s)")
     return _verdict("break")

@@ -450,9 +450,16 @@ def finalize_turn(
         logger=logger,
     )
 
+    # Recovery exits also need the barrier. Waiting ends this turn, not the task.
+    from agent.turn_stop_gates import required_child_completion_note
+    from tools.async_delegation import pending_required_delegations
+    pending_children = [] if interrupted else pending_required_delegations(
+        getattr(agent, "session_id", None), getattr(agent, "_session_db", None))
     completed = (
         final_response is not None
         and not failed
+        and not interrupted
+        and not pending_children
         and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
     )
 
@@ -480,6 +487,9 @@ def finalize_turn(
         final_response, _recovered_from_stream = _recover_final_from_stream(
             agent, final_response, interrupted, failed
         )
+        # Recover visible stream text before adding a nonempty waiting note.
+        if pending_children:
+            final_response, _pending = required_child_completion_note(agent, final_response)
         _close_transcript_tail(agent, messages, final_response, interrupted, _recovered_from_stream)
         if not interrupted and not failed:
             _micro_compact_after_turn(agent, messages, final_response, logger)
@@ -541,6 +551,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        **({"pending_required_delegations": pending_children} if pending_children else {}),
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls

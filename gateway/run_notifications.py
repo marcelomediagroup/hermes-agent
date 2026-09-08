@@ -1300,7 +1300,12 @@ class GatewayNotificationsMixin:
                 if self._completion_identity_seen(identity, claim=True):
                     return None
                 identity_claimed = True
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
+            from tools.async_delegation import consuming_delegation_results
+            consumed_events = [evt, *(event for event, _claim_id in sibling_claims)]
+            with consuming_delegation_results(consumed_events):
+                injection_result = await self._inject_watch_notification(
+                    synth_text, evt, raise_not_accepted=True,
+                )
             if injection_result is not True:
                 return injection_result
             accepted = True

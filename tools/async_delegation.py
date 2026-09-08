@@ -18,6 +18,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
@@ -36,6 +37,7 @@ _executor_max_workers: int = 0
 _records_lock = threading.Lock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: Dict[str, Dict[str, Any]] = {}
+_consuming_results: ContextVar[frozenset[str]] = ContextVar("consuming_delegation_results", default=frozenset())
 
 _DEFAULT_MAX_ASYNC_CHILDREN = 3
 # Completed records retained (in memory and in the ledger) for status queries.
@@ -321,9 +323,12 @@ def _update_delivery(sql: str, params: tuple) -> bool:
 def mark_completion_delivered(delegation_id: str) -> bool:
     """Atomically acknowledge successful injection of a durable completion."""
     now = time.time()
-    return _update_delivery(
+    delivered = _update_delivery(
         """UPDATE async_delegations SET delivery_state='delivered', delivered_at=?, updated_at=?
            WHERE delegation_id=? AND delivery_state!='delivered'""", (now, now, delegation_id))
+    if delivered:
+        _release_completion_requirement(delegation_id)
+    return delivered
 
 
 def claim_completion_delivery(delegation_id: str, claim_id: str) -> bool:
@@ -407,11 +412,16 @@ def drop_completion_delivery(delegation_id: str, claim_id: str) -> bool:
 def complete_completion_delivery(delegation_id: str, claim_id: str) -> bool:
     """Acknowledge acceptance for the consumer holding this claim."""
     now = time.time()
-    return _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
+    delivered = _update_delivery("""UPDATE async_delegations SET delivery_state='delivered',
                   delivered_at=?, updated_at=?, delivery_claim=NULL,
                   delivery_claimed_at=NULL
            WHERE delegation_id=? AND delivery_state='pending'
              AND delivery_claim=?""", (now, now, delegation_id, claim_id))
+    # Claims accept legacy/pruned ledger rows. Delivery must also release their
+    # process-local requirement; a wrong claim on a retained row must not.
+    if delivered or get_durable_delegation(delegation_id) is None:
+        _release_completion_requirement(delegation_id)
+    return delivered
 
 
 def complete_event_delivery(evt: Dict[str, Any], claim_id: str) -> None:
@@ -440,6 +450,50 @@ def get_durable_delegation(delegation_id: str) -> Optional[Dict[str, Any]]:
 
 
 # ── In-memory registry queries ──────────────────────────────────────────────
+def _release_completion_requirement(delegation_id: str) -> None:
+    with _records_lock:
+        if record := _records.get(delegation_id):
+            record["_completion_pending"] = False
+
+
+def pending_required_delegations(parent_session_id: Optional[str], session_db=None) -> List[str]:
+    """Required child work includes terminal results not yet accepted by delivery.
+
+    This is process-local like the workers, not a restart-durable task manager.
+    Use the durable parent id, never the routing key (which survives /new).
+    """
+    if not isinstance(parent_session_id, str) or not parent_session_id:
+        return []
+    home = str(get_hermes_home())
+    consuming = _consuming_results.get()
+    with _records_lock:
+        candidates = [(rid, r.get("parent_session_id")) for rid, r in _records.items()
+                      if r.get("_completion_pending") and r.get("_home") == home and rid not in consuming]
+    # Compression can rotate durable ids without ending the task. Reuse the
+    # canonical chain resolver, which excludes /new, forks and delegated children.
+    resolver = getattr(type(session_db), "get_compression_tip", None)
+    return sorted(rid for rid, parent in candidates
+                  if parent == parent_session_id
+                  or (callable(resolver) and resolver(session_db, parent) == parent_session_id))
+
+
+@contextmanager
+def consuming_delegation_results(events: List[Dict[str, Any]]) -> Iterator[None]:
+    """Scope actual result injection, not mere claims, until its post-turn ack.
+
+    Failed/released claims still block; concurrent turns cannot borrow consumption.
+    Interim failure notices must not release their still-running batch.
+    """
+    ids = frozenset(str(e["delegation_id"]) for e in events
+                    if e.get("type") == "async_delegation" and e.get("delegation_id")
+                    and not is_interim_delegation_event(e))
+    token = _consuming_results.set(_consuming_results.get() | ids)
+    try:
+        yield
+    finally:
+        _consuming_results.reset(token)
+
+
 def _get_executor(max_workers: int) -> ThreadPoolExecutor:
     """Lazily create (or grow in place, never shrink) the shared daemon executor. Raising
     ``_max_workers`` is enough: the next ``submit`` spawns threads up to the new cap."""
@@ -481,7 +535,7 @@ def _session_records(statuses, session_key: str, origin_ui_session_id: str, pare
     if not selectors:
         return []
     with _records_lock:
-        return [r for r in _records.values() if r.get("status") in statuses
+        return [r for r in _records.values() if (statuses is None or r.get("status") in statuses)
                 and any(str(r.get(field) or "") == wanted for field, wanted in selectors)]
 
 
@@ -496,7 +550,8 @@ def _new_delegation_id() -> str:
 
 def _prune_completed_locked() -> None:
     """Drop the oldest completed records beyond the cap. Caller holds ``_records_lock``."""
-    completed = [(rid, r) for rid, r in _records.items() if r.get("status") != "running"]
+    completed = [(rid, r) for rid, r in _records.items()
+                 if r.get("status") not in _LIVE_STATES and not r.get("_completion_pending")]
     completed.sort(key=lambda kv: kv[1].get("completed_at") or kv[1].get("dispatched_at") or 0)
     for rid, _ in completed[: max(0, len(completed) - _MAX_RETAINED_COMPLETED)]:
         _records.pop(rid, None)
@@ -558,6 +613,9 @@ def _dispatch(
         "origin_session_id": origin_session_id, "parent_session_id": parent_session_id,
         **_capture_routing_origin(),
         "status": "running", "dispatched_at": dispatched_at, "completed_at": None,
+        # delegate_task uses batch units even for one child. Standalone background
+        # jobs (cron's single-runner API) are detached, not task dependencies.
+        "_completion_pending": bool(is_batch and parent_session_id), "_home": str(get_hermes_home()),
         "interrupt_fn": interrupt_fn, **({"is_batch": True} if is_batch else {}), "progress_fn": progress_fn,
         "slot_key": slot_key or delegation_id,
         # Which of the call's ``goals`` this unit runs (None = all of them).
@@ -948,9 +1006,13 @@ def list_async_delegations() -> List[Dict[str, Any]]:
 
 def _interrupt_records(targets: List[Dict[str, Any]], caller: str, reason: str, msg: str) -> int:
     """Call ``interrupt_fn`` on each record; log ``msg`` once; returns how many succeeded."""
+    # Explicit stop abandons requirements, including already-finished results,
+    # without faking child success or acknowledging an undelivered event.
+    for r in targets:
+        _release_completion_requirement(r["delegation_id"])
     count = sum(
         _call_interrupt(r.get("interrupt_fn"), "%s: %s interrupt failed: %s", caller, r.get("delegation_id"))
-        for r in targets)
+        for r in targets if r.get("status") in _ACTIVE_STATES)
     if count:
         logger.info(msg, count, reason)
     return count
@@ -961,7 +1023,7 @@ def interrupt_all(reason: str = "shutdown") -> int:
     many. The child still emits a completion event (status='interrupted') via the
     normal finalize path."""
     with _records_lock:
-        targets = [r for r in _records.values() if r.get("status") in _ACTIVE_STATES]
+        targets = list(_records.values())
     return _interrupt_records(targets, "interrupt_all", reason, "Interrupted %d async delegation(s) (%s)")
 
 
@@ -970,7 +1032,7 @@ def interrupt_for_session(
 ) -> int:
     """Signal running async delegations owned by ONE ending session to stop (any
     selector matches, see ``_session_records``). Returns how many."""
-    targets = _session_records(_ACTIVE_STATES, session_key, origin_ui_session_id, parent_session_id)
+    targets = _session_records(None, session_key, origin_ui_session_id, parent_session_id)
     return _interrupt_records(
         targets, "interrupt_for_session", reason, "Interrupted %d async delegation(s) for ending session (%s)")
 
