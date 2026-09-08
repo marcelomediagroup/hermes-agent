@@ -3,10 +3,13 @@ value-setter methods (mixed into ``CuaDriverBackend``)."""
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 from tools.computer_use.backend import ActionResult
 from tools.computer_use.cua_backend_parse import _parse_key_combo
+
+if TYPE_CHECKING:
+    from tools.computer_use.cua_backend_session import _CuaDriverSession
 
 _NO_TARGET_MSG = "No active window — call capture() first."
 _BTF_UNSUPPORTED_MSG = "The connected cua-driver does not advertise the standalone bring_to_front tool."
@@ -23,6 +26,8 @@ def _refuse(action: str, message: str, **fields: Any) -> ActionResult:
 
 class _InputMixin:
     """Pointer / keyboard / value-setter actions against the sticky target."""
+
+    _session: _CuaDriverSession
 
     def _bind_indexed_input(self, action: str, args: Dict[str, Any]) -> Optional[ActionResult]:
         """Never dispatch a bare index or invent a token from an index/snapshot string."""
@@ -122,7 +127,13 @@ class _InputMixin:
         button_norm = (button or "left").lower()
         if button_norm not in {"left", "right", "middle"}:
             return _refuse("click", f"unknown button {button!r} — expected left, right, middle.")
-        tool, args["button"] = ("double_click" if click_count == 2 else "click"), button_norm
+        tool = "double_click" if click_count == 2 else "click"
+        # The standalone double_click schema may only support a default left click.
+        if tool == "click" or self._session.supports_input_property(tool, "button"):
+            args["button"] = button_norm
+        elif button_norm != "left":
+            return _refuse(tool, "The connected cua-driver does not accept button for double_click.",
+                           code="button_unsupported")
         refusal = self._pointer_args(tool, args, (
             ("element_index click", {"element_index": element} if element is not None else None),
             ("coordinate click", {"x": x, "y": y} if x is not None and y is not None else None),
