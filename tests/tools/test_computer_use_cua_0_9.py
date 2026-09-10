@@ -67,7 +67,9 @@ def _make_backend(session: _FakeSession):
     backend = CuaDriverBackend.__new__(CuaDriverBackend)
     backend._session = session
     backend._session_id = "hermes-session"
-    backend._snapshot_tokens = {}
+    backend._clear_active_target()
+    backend._snapshot_tokens = {3: "s00000001:3"}
+    session.input_properties.setdefault("click", set()).add("element_token")
     backend._active_pid = 42
     backend._active_window_id = 7
     return backend

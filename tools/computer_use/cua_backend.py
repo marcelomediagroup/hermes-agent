@@ -309,11 +309,16 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         # re-resolving to a different element. Cleared whenever a fresh capture overwrites the snapshot
         # context.
         self._snapshot_tokens: Dict[int, str] = {}
+        self._snapshot_id: Optional[str] = None
+        self._snapshot_indices: set[int] = set()
 
     def _set_active_target(self, target: Dict[str, Any]) -> None:
         self._active_pid = target["pid"]
         self._active_window_id = target["window_id"]
-        self._snapshot_tokens = {}  # prior snapshot's tokens: disarm before any capture so an exception can't pair them
+        # Disarm before capture so failures and vision-only captures cannot retain AX authority.
+        self._snapshot_tokens = {}
+        self._snapshot_id = None
+        self._snapshot_indices = set()
         self._last_target = {"pid": self._active_pid, "window_id": self._active_window_id}
 
     def launch_app(self, *, bundle_id: Optional[str] = None, name: Optional[str] = None,
@@ -353,12 +358,9 @@ class CuaDriverBackend(_CaptureMixin, _InputMixin, ComputerUseBackend):
         return self._session.call_tool(name, payload, timeout=timeout)
 
     def _action(self, name: str, args: Dict[str, Any], *, inject_session: bool = True) -> ActionResult:
-        # Attach the snapshot's `element_token` to an `element_index` call so a superseded snapshot yields an explicit
-        # 'stale' error. Gated on the per-tool capability: older drivers (`additionalProperties: false`) must never see it.
-        idx = args.get("element_index")
-        token = self._snapshot_tokens.get(idx) if isinstance(idx, int) else None
-        if token and self._session.supports_capability("accessibility.element_tokens", tool=name):
-            args["element_token"] = token
+        refusal = self._bind_indexed_input(name, args)
+        if refusal is not None:
+            return refusal
         if inject_session:  # setdefault preserves any explicit session a caller already supplied
             args.setdefault("session", self._session_id)
         try:

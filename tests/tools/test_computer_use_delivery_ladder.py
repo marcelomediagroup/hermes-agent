@@ -71,7 +71,10 @@ def _make_backend(session: _FakeSession):
     be = CuaDriverBackend.__new__(CuaDriverBackend)
     be._session = session               # type: ignore[attr-defined]
     be._session_id = "test-run"          # type: ignore[attr-defined]
-    be._snapshot_tokens = {}             # type: ignore[attr-defined]
+    be._clear_active_target()
+    be._snapshot_tokens = {1: "s00000001:1", 3: "s00000001:3"}
+    for tool in ("click", "scroll"):
+        session._input_properties.setdefault(tool, set()).add("element_token")
     be._active_pid = 4242                # type: ignore[attr-defined]
     be._active_window_id = 7             # type: ignore[attr-defined]
     return be

@@ -24,6 +24,24 @@ def _refuse(action: str, message: str, **fields: Any) -> ActionResult:
 class _InputMixin:
     """Pointer / keyboard / value-setter actions against the sticky target."""
 
+    def _bind_indexed_input(self, action: str, args: Dict[str, Any]) -> Optional[ActionResult]:
+        """Never dispatch a bare index or invent a token from an index/snapshot string."""
+        if "element_index" not in args:
+            return None
+        idx = args["element_index"]
+        token = self._snapshot_tokens.get(idx) if type(idx) is int else None
+        if token and (self._session.supports_input_property(action, "element_token")
+                      or self._session.supports_capability("accessibility.element_tokens", tool=action)):
+            args["element_token"] = token
+            return None
+        if (type(idx) is int and idx in self._snapshot_indices and self._snapshot_id
+                and self._session.supports_input_property(action, "snapshot_id")):
+            args["snapshot_id"] = self._snapshot_id
+            return None
+        return _refuse(action, "Indexed input requires a captured element token or a supported snapshot_id. "
+                       "Capture the exact window again; otherwise explicitly use screenshot coordinates.",
+                       code="snapshot_binding_required")
+
     def _target_args(self, action: str, *, need_window: bool = False) -> Tuple[Optional[ActionResult], Dict[str, Any]]:
         """``(refusal, base args)`` for an input action against the sticky target."""
         if self._active_pid is None or (need_window and self._active_window_id is None):
@@ -67,6 +85,9 @@ class _InputMixin:
         input-action property: when requested, the separately approved standalone focus action runs first,
         then the original foreground input runs unchanged."""
         refusal = self._apply_delivery(action, args, delivery_mode)
+        if refusal is not None:
+            return refusal
+        refusal = self._bind_indexed_input(action, args)
         if refusal is not None:
             return refusal
         if bring_to_front:
@@ -114,11 +135,14 @@ class _InputMixin:
              from_xy: Optional[Tuple[int, int]] = None, to_xy: Optional[Tuple[int, int]] = None,
              button: str = "left", modifiers: Optional[List[str]] = None,
              delivery_mode: Optional[str] = None, bring_to_front: bool = False) -> ActionResult:
+        # The live drag schema is pixel-only: no endpoint-token/snapshot contract exists.
+        # Do not guess field names or silently substitute coordinates for indexed intent.
+        if from_element is not None or to_element is not None:
+            return _refuse("drag", "Indexed drag has no supported snapshot binding; explicitly use "
+                           "from_coordinate/to_coordinate from a fresh screenshot.", code="snapshot_binding_required")
         refusal, args = self._target_args("drag")
         if refusal is None:
             refusal = self._pointer_args("drag", args, (
-                ("element-based drag", {"from_element": from_element, "to_element": to_element}
-                 if from_element is not None and to_element is not None else None),
                 ("coordinate drag", {"from_x": int(from_xy[0]), "from_y": int(from_xy[1]),
                                      "to_x": int(to_xy[0]), "to_y": int(to_xy[1])}
                  if from_xy is not None and to_xy is not None else None),
@@ -132,15 +156,14 @@ class _InputMixin:
         if refusal is not None:
             return refusal
         args.update(direction=direction, amount=max(1, min(50, amount)))
-        # An element without a known window_id is not an addressing form here; scrolling then falls through
-        # to the coordinate form or the bare window. Some driver schemas reject x/y on scroll: only send
+        # Never drop an explicit element target. Some driver schemas reject x/y on scroll: only send
         # coordinates when the driver advertises support; otherwise it scrolls the targeted window
         # (window_id is still sent for routing).
         xy = lambda: ({"x": x, "y": y}  # noqa: E731
                       if self._session.supports_capability("input.scroll.coordinates", tool="scroll") else {})
         refusal = self._pointer_args("scroll", args, (
             ("element scroll", {"element_index": element}
-             if element is not None and self._active_window_id is not None else None),
+             if element is not None else None),
             ("coordinate scroll", xy if x is not None and y is not None else None),
         ), None)
         return refusal if refusal is not None else self._run_input_action("scroll", args, delivery_mode, bring_to_front)

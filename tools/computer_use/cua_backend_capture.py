@@ -273,6 +273,9 @@ class _CaptureMixin:
                     else _parse_elements_from_tree(tree) if tree else [])
         # Tokens are tied to this snapshot: overwrite the whole map (and clear it when the new capture carries none).
         self._snapshot_tokens = {e.index: e.element_token for e in elements if e.element_token}
+        snapshot_id = (gws_out.get("structuredContent") or {}).get("snapshot_id")
+        self._snapshot_id = snapshot_id if isinstance(snapshot_id, str) and snapshot_id else None
+        self._snapshot_indices = {e.index for e in elements}
         return *_image_from_tool_result(gws_out), elements, window_title
 
     def capture(self, mode: str = "som", app: Optional[str] = None, pid: Optional[int] = None,

@@ -1790,7 +1790,9 @@ class TestClickButtonPassthrough:
             "structuredContent": None,
             "isError": False,
         }
-        # Pretend capture() ran and resolved a target.
+        # Pretend capture() ran and resolved a target and its indexed element.
+        backend._snapshot_tokens = {5: "s00000001:5"}
+        backend._session.supports_input_property.return_value = True
         backend._active_pid = 111
         backend._active_window_id = 222
         return backend
