@@ -95,6 +95,8 @@ class StreamFallbackMixin:
         final_text = ensure_closed_code_fences(self._clean_for_display(text))
         continuation = self._continuation_text(final_text)
         self._fallback_final_send = False
+        if not continuation.strip() and final_text.strip() and self._needs_final_user_mention():
+            continuation = final_text
         if not continuation.strip():
             continuation = await self._fallback_when_nothing_unseen(final_text)
             if continuation is None:
@@ -107,9 +109,12 @@ class StreamFallbackMixin:
         last_message_id: Optional[str] = None
         last_successful_chunk = ""
         sent_any_chunk = False
-        for chunk in chunks:
+        for chunk_index, chunk in enumerate(chunks):
             result = await self._send_with_flood_retry(
-                content=chunk, retry_log="Flood control on fallback send, retrying in %.1fs")
+                content=chunk,
+                retry_log="Flood control on fallback send, retrying in %.1fs",
+                final=chunk_index == 0,
+            )
             if not result or not result.success:
                 # Partial continuation landed: do NOT set _final_response_sent (the
                 # gateway must still deliver the full answer); _already_sent only
@@ -201,11 +206,13 @@ class StreamFallbackMixin:
                 logger.debug("per-chat limit resolution failed: %s", e)
         return _len_fn, raw_limit
 
-    async def _send_with_flood_retry(self, *, content: str, retry_log: str, reply_to=None):
+    async def _send_with_flood_retry(
+        self, *, content: str, retry_log: str, reply_to=None, final: bool = True,
+    ):
         """adapter.send(final metadata) with ONE bounded flood retry; returns the last
         SendResult.  Exceptions propagate (callers decide whether a raise is "ambiguous")."""
         kwargs = dict(chat_id=self.chat_id, content=content,
-                      metadata=self._metadata_for_send(final=True))
+                      metadata=self._metadata_for_send(final=final))
         if reply_to is not None:
             kwargs["reply_to"] = reply_to
         result = None

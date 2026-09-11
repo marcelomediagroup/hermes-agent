@@ -1983,6 +1983,15 @@ class GatewayTurnMixin:
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
+            _delivery_source = (
+                agent_result.get("_delivery_source")
+                if isinstance(agent_result, dict)
+                else None
+            )
+            if _delivery_source is not None:
+                source = _delivery_source
+                event.source = _delivery_source
+
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
             # send (bracketed by the adapter against this event) must be ledgered under that
             # message's id or it collides with an earlier turn's row carrying the same text. Reply
@@ -2771,15 +2780,16 @@ class GatewayTurnMixin:
 
         The connector will auto-thread on the reply anchor (thread is born on its FIRST send), so
         carrying it routes progress / status bubbles into the same thread as the final reply."""
-        if not _progress_thread_id:
-            metadata = None
-        elif _progress_thread_id == source.thread_id:
-            metadata = self._thread_metadata_for_source(source, event_message_id)
-        else:
+        metadata = self._thread_metadata_for_source(source, event_message_id)
+        if _progress_thread_id and _progress_thread_id != source.thread_id:
             metadata = self._thread_metadata_for_target(
                 source.platform, source.chat_id, _progress_thread_id,
                 chat_type=getattr(source, "chat_type", None), reply_to_message_id=event_message_id,
             )
+            requester_user_id = getattr(source, "user_id", None)
+            if requester_user_id and source.platform == Platform.DISCORD:
+                metadata = dict(metadata or {})
+                metadata["requester_user_id"] = str(requester_user_id)
         if metadata is None and _relay_prospective_thread_id:
             metadata = {"reply_to_message_id": event_message_id}
         return metadata
@@ -3525,6 +3535,8 @@ class GatewayTurnMixin:
             channel_prompt=next_channel_prompt, message_type=next_message_type,
         )
         merged = _preserve_queued_followup_history_offset(result, followup_result)
+        if isinstance(merged, dict):
+            merged.setdefault("_delivery_source", next_source)
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -3587,8 +3599,8 @@ class GatewayTurnMixin:
         ``response["already_sent"]`` and log ``ok``. ``fail_result`` (None = trust the call) logs a
         returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
         try:
-            _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+            _res = await _sc._edit_message(
+                message_id=_sc.message_id, content=content, finalize=True, notify=True,
             )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)

@@ -339,8 +339,9 @@ class GatewayNotificationsMixin:
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
+                        _edit_res = await stream_consumer._edit_message(
+                            message_id=_sc_msg_id, content=text_content,
+                            finalize=True, notify=True,
                         )
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
@@ -394,7 +395,9 @@ class GatewayNotificationsMixin:
                 MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
                 session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
-            result = await adapter.send(source.chat_id, text_content, metadata=metadata)
+            result = await adapter.send(
+                source.chat_id, text_content, metadata=_mark_notify_metadata(metadata),
+            )
         if not getattr(result, "success", False):
             logger.warning(
                 "Queued-lane final send to %s failed: %s", getattr(source, "chat_id", "?"),

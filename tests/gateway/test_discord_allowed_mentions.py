@@ -84,9 +84,10 @@ _ensure_discord_mock()
 from plugins.platforms.discord.adapter import _build_allowed_mentions  # noqa: E402
 
 
-# The four DISCORD_ALLOW_MENTION_* env vars that _build_allowed_mentions reads.
+# Mention-related env vars that _build_allowed_mentions reads.
 # Cleared before each test so env leakage from other tests never masks a regression.
 _ENV_VARS = (
+    "DISCORD_MENTION_USER_ON_FINAL",
     "DISCORD_ALLOW_MENTION_EVERYONE",
     "DISCORD_ALLOW_MENTION_ROLES",
     "DISCORD_ALLOW_MENTION_USERS",

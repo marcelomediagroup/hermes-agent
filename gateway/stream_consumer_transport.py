@@ -22,7 +22,10 @@ class StreamTransportMixin:
 
     _MIN_NEW_MSG_CHARS = 4
 
-    async def _edit_message(self, *, message_id: str, content: str, finalize: bool = False):
+    async def _edit_message(
+        self, *, message_id: str, content: str, finalize: bool = False,
+        notify: bool = False,
+    ):
         """Edit via the adapter, passing routing metadata when supported."""
         # Contract: adapters must accept finalize= even when False (test-guarded).
         kwargs = dict(chat_id=self.chat_id, message_id=message_id, content=content,
@@ -32,7 +35,9 @@ class StreamTransportMixin:
                 params = inspect.signature(self.adapter.edit_message).parameters
                 if "metadata" in params or any(
                     param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()):
-                    kwargs["metadata"] = self.metadata
+                    kwargs["metadata"] = self._metadata_for_send(
+                        final=notify, expect_edits=not finalize,
+                    )
             except (TypeError, ValueError):
                 pass
         return await self.adapter.edit_message(**kwargs)
@@ -276,7 +281,8 @@ class StreamTransportMixin:
         stale_ids = self._stale_preview_ids()
         try:
             result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, metadata=self._metadata_for_send(final=True))
+                chat_id=self.chat_id, content=text,
+                metadata=self._metadata_for_send(final=is_turn_final))
         except Exception as e:
             logger.debug("Fresh-final send failed, falling back to edit: %s", e)
             return False
@@ -344,7 +350,9 @@ class StreamTransportMixin:
         self._last_edit_overflowed = False
         try:
             if self._message_id is None:
-                return await self._first_send(text, finalize=finalize)
+                return await self._first_send(
+                    text, finalize=finalize, is_turn_final=is_turn_final,
+                )
             if not self._edit_supported:
                 return False  # edits unsupported; fallback path sends the final
             return await self._edit_existing(text, finalize=finalize, is_turn_final=is_turn_final)
@@ -428,7 +436,9 @@ class StreamTransportMixin:
         # send must still fire so the user gets a real message.
         return True if await self._send_draft_frame(frame_text) else None
 
-    async def _first_send(self, text: str, *, finalize: bool) -> bool:
+    async def _first_send(
+        self, text: str, *, finalize: bool, is_turn_final: bool = True,
+    ) -> bool:
         """First send, threaded to the user's message (correct topic/thread)."""
         if getattr(self, "_egress_declined", False):
             # The connector refused this destination earlier in the run (see
@@ -441,7 +451,10 @@ class StreamTransportMixin:
             return False
         result = await self.adapter.send(
             chat_id=self.chat_id, content=text, reply_to=self._initial_reply_to_id,
-            metadata=self._metadata_for_send(final=finalize, expect_edits=not finalize))
+            metadata=self._metadata_for_send(
+                final=finalize and is_turn_final,
+                expect_edits=not (finalize and is_turn_final),
+            ))
         if not result.success:
             self._edit_supported = False
             return False
@@ -459,9 +472,14 @@ class StreamTransportMixin:
 
     async def _edit_existing(self, text: str, *, finalize: bool, is_turn_final: bool) -> bool:
         """Edit the live preview (or replace it via fresh-final when finalizing)."""
-        # REQUIRES_EDIT_FINALIZE adapters need the finalize=True edit even when
-        # unchanged; everyone else short-circuits.
-        if text == self._last_sent_text and not (finalize and self._adapter_requires_finalize):
+        # A requester mention is applied only by a notify-worthy edit, so an
+        # unchanged preview still needs one terminal edit in final-mention mode.
+        needs_final_notification_edit = bool(
+            finalize and is_turn_final and self._needs_final_user_mention()
+        )
+        if text == self._last_sent_text and not (
+            finalize and (self._adapter_requires_finalize or needs_final_notification_edit)
+        ):
             return True
         # Fresh-final: replace a long-lived preview with a fresh message, or whenever
         # the adapter prefers it (Telegram's send path renders richer markdown).  An
@@ -476,8 +494,10 @@ class StreamTransportMixin:
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final())
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
-        result = await self._edit_message(message_id=self._message_id, content=text,
-                                          finalize=finalize)
+        result = await self._edit_message(
+            message_id=self._message_id, content=text, finalize=finalize,
+            notify=finalize and is_turn_final,
+        )
         if not result.success:
             return await self._on_edit_failure(result, text, finalize=finalize,
                                                is_turn_final=is_turn_final)

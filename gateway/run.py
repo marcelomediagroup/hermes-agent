@@ -4054,6 +4054,10 @@ class GatewayRunner(
             getattr(source, "platform", None), getattr(source, "chat_id", None),
             getattr(source, "thread_id", None), chat_type=getattr(source, "chat_type", None),
             reply_to_message_id=reply_to_message_id or getattr(source, "message_id", None))
+        requester_user_id = getattr(source, "user_id", None)
+        if requester_user_id and getattr(source, "platform", None) == Platform.DISCORD:
+            metadata = dict(metadata or {})
+            metadata["requester_user_id"] = str(requester_user_id)
         if getattr(source, "platform", None) == Platform.SLACK:
             # Per-turn egress identity: Slack chat.startStream needs recipient_user_id/team_id; the relay
             # adapter's _with_scope fallback reads per-chat caches a CONCURRENT turn overwrites.

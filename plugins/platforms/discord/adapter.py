@@ -610,25 +610,40 @@ def check_discord_requirements() -> bool:
     return True
 
 
-def _build_allowed_mentions():
-    """Build Discord ``AllowedMentions`` denying @everyone/@here/roles by default (any LLM output
-    with ``@everyone`` would otherwise ping the server); user / replied-user pings stay on.
+def _setting_bool(env_name: str, configured: Any, default: bool) -> bool:
+    """Resolve a boolean with explicit env override over instance config."""
+    raw = os.getenv(env_name, "").strip().lower()
+    if raw:
+        return raw in {"true", "1", "yes", "on"}
+    if configured is None or configured == "":
+        return default
+    if isinstance(configured, bool):
+        return configured
+    return str(configured).strip().lower() in {"true", "1", "yes", "on"}
 
-    Override via env (or ``discord.allow_mentions.*`` in config.yaml):
 
-        DISCORD_ALLOW_MENTION_EVERYONE      default false  — @everyone + @here
-        DISCORD_ALLOW_MENTION_ROLES         default false  — @role pings
-        DISCORD_ALLOW_MENTION_USERS         default true   — @user pings
-        DISCORD_ALLOW_MENTION_REPLIED_USER  default true   — reply-ping author
-    """
+def _build_allowed_mentions(
+    *, configured: Optional[Dict[str, Any]] = None,
+    mention_user_on_final: Optional[bool] = None,
+):
+    """Build safe Discord mention policy with env-over-instance precedence."""
     if not DISCORD_AVAILABLE:
         return None
-    _b = _env_bool
+    configured = configured if isinstance(configured, dict) else {}
+
+    def _b(name: str, key: str, default: bool) -> bool:
+        return _setting_bool(name, configured.get(key), default)
+
+    final_mentions = _setting_bool(
+        "DISCORD_MENTION_USER_ON_FINAL", mention_user_on_final, False,
+    )
     return discord.AllowedMentions(
-        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", False),
-        roles=_b("DISCORD_ALLOW_MENTION_ROLES", False),
-        users=_b("DISCORD_ALLOW_MENTION_USERS", True),
-        replied_user=_b("DISCORD_ALLOW_MENTION_REPLIED_USER", True),
+        everyone=_b("DISCORD_ALLOW_MENTION_EVERYONE", "everyone", False),
+        roles=_b("DISCORD_ALLOW_MENTION_ROLES", "roles", False),
+        users=_b("DISCORD_ALLOW_MENTION_USERS", "users", True),
+        replied_user=_b(
+            "DISCORD_ALLOW_MENTION_REPLIED_USER", "replied_user", not final_mentions,
+        ),
     )
 
 
@@ -961,10 +976,24 @@ _DISCORD_PROMPT_TIMEOUT_MAX = 900
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.getenv(name, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"true", "1", "yes", "on"}
+    return _setting_bool(name, None, default)
+
+
+def _with_final_user_mention(
+    content: str, metadata: Optional[Dict[str, Any]], *, enabled: Optional[bool] = None,
+) -> str:
+    """Prefix only notify-worthy replies with the requesting Discord user."""
+    if not _setting_bool("DISCORD_MENTION_USER_ON_FINAL", enabled, False):
+        return content
+    if not metadata or metadata.get("notify") is not True:
+        return content
+    requester_user_id = str(metadata.get("requester_user_id") or "").strip()
+    if not requester_user_id.isdigit():
+        return content
+    mention = f"<@{requester_user_id}>"
+    if content.startswith(mention):
+        return content
+    return f"{mention}\n{content}" if content else mention
 
 
 def _read_discord_prompt_timeout() -> int:
@@ -1089,6 +1118,15 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._dedup = MessageDeduplicator()
         # Reply threading mode: "off", "first" (default; first chunk only), "all" (every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        self._mention_user_on_final = _setting_bool(
+            "DISCORD_MENTION_USER_ON_FINAL",
+            self.config.extra.get("mention_user_on_final"),
+            False,
+        )
+        allow_mentions = self.config.extra.get("allow_mentions")
+        self._allow_mentions_config: Dict[str, Any] = (
+            dict(allow_mentions) if isinstance(allow_mentions, dict) else {}
+        )
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
         # Bot's last message ID per channel: lets history backfill skip the full channel.history() scan.
         self._last_self_message_id: Dict[str, str] = {}
@@ -1102,6 +1140,11 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Telegram #58563 fix.
         self._last_overflow_preview: Dict[tuple, str] = {}
         self._warned_fail_closed_default = False
+
+    @property
+    def mention_user_on_final_enabled(self) -> bool:
+        """Whether this adapter instance emits final requester mentions."""
+        return self._mention_user_on_final
 
     def _config_value(self, key: str, default: Any, *, env_key: Optional[str] = None) -> Any:
         """Resolve a liveness value from profile config, legacy env, or default."""
@@ -1226,7 +1269,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             self._client = commands.Bot(
                 command_prefix="!",  # Not really used, we handle raw messages
                 intents=intents,
-                allowed_mentions=_build_allowed_mentions(),
+                allowed_mentions=_build_allowed_mentions(
+                    configured=self._allow_mentions_config,
+                    mention_user_on_final=self._mention_user_on_final,
+                ),
                 **proxy_kwargs_for_bot(proxy_url),
             )
             adapter_self = self  # capture for closure
@@ -2844,6 +2890,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             # Backfill replays from this table: record the dropped final reply as failed or it is lost.
             return await self._record_response_async(reply_to, result, content, bool(metadata and metadata.get("notify")))
         try:
+            content = _with_final_user_mention(
+                content, metadata, enabled=self._mention_user_on_final,
+            )
             thread_id = None
             if metadata and metadata.get("thread_id"):
                 thread_id = metadata["thread_id"]
@@ -3017,6 +3066,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if not self._client:
             return SendResult(success=False, error="Not connected")
         try:
+            content = _with_final_user_mention(
+                content, metadata, enabled=self._mention_user_on_final,
+            )
             channel = await self._resolve_channel(chat_id)
             msg = channel.get_partial_message(int(message_id))
             formatted = self.format_message(content)
@@ -7102,12 +7154,13 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     hbl = discord_cfg.get("history_backfill_limit")
     if hbl is not None:
         _env_default("DISCORD_HISTORY_BACKFILL_LIMIT", str(hbl))
-    # allow_mentions: safe defaults live in the adapter; these keys only override when set.
+    if "mention_user_on_final" in discord_cfg:
+        seeded_extra["mention_user_on_final"] = discord_cfg["mention_user_on_final"]
+    # Mention policy stays instance-owned so multiplexed profiles cannot leak
+    # through process-global environment bridges. Explicit env still overrides.
     allow_mentions_cfg = discord_cfg.get("allow_mentions")
     if isinstance(allow_mentions_cfg, dict):
-        for yaml_key in ("everyone", "roles", "users", "replied_user"):
-            if yaml_key in allow_mentions_cfg:
-                _env_default(f"DISCORD_ALLOW_MENTION_{yaml_key.upper()}", str(allow_mentions_cfg[yaml_key]).lower())
+        seeded_extra["allow_mentions"] = dict(allow_mentions_cfg)
     # reply_to_mode: top-level preferred, falls back to extra; YAML 1.1 parses bare 'off' as False.
     _discord_extra = discord_cfg.get("extra") if isinstance(discord_cfg.get("extra"), dict) else {}
     _discord_rtm = discord_cfg["reply_to_mode"] if "reply_to_mode" in discord_cfg else _discord_extra.get("reply_to_mode")

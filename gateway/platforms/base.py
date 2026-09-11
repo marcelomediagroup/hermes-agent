@@ -105,6 +105,9 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
     thread_id = getattr(source, "thread_id", None)
     platform = _platform_name(getattr(source, "platform", None))
     metadata = {"thread_id": thread_id} if thread_id is not None else {}
+    requester_user_id = getattr(source, "user_id", None)
+    if requester_user_id and platform == "discord":
+        metadata["requester_user_id"] = str(requester_user_id)
     # Slack workspace identity is routing state: carry it so a multi-workspace Socket Mode
     # gateway never falls back to its primary WebClient.
     scope_id = getattr(source, "scope_id", None) if platform == "slack" else None
@@ -3976,6 +3979,11 @@ class BasePlatformAdapter(ABC):
         try:
             await self._run_processing_hook("on_processing_start", event)
             response = await self._message_handler(event)
+            # An in-band queued follow-up may replace the source with another requester
+            # in the same shared session. Route the terminal reply to that requester.
+            _thread_metadata = _thread_metadata_for_source(
+                event.source, _reply_anchor_for_event(event),
+            )
             is_ephemeral_response = isinstance(response, EphemeralReply)
             # Unwrap EphemeralReply for downstream text processing; TTL applies after send.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)

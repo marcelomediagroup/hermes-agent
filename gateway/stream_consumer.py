@@ -260,6 +260,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             meta["notify"] = True
         return meta or None
 
+    def _needs_final_user_mention(self) -> bool:
+        requester_user_id = str(
+            (self.metadata or {}).get("requester_user_id") or ""
+        ).strip()
+        return bool(
+            requester_user_id.isdigit()
+            and getattr(self.adapter, "mention_user_on_final_enabled", False) is True
+        )
+
     # Read-only views for the gateway (flag semantics: see _clear_turn_final_flags).
     already_sent = property(lambda self: self._already_sent)
     final_response_sent = property(lambda self: self._final_response_sent)
@@ -727,11 +736,15 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             chunks = self._split_text_chunks(self._accumulated, self._safe_limit, self._len_fn)
         reply_to = self._initial_reply_to_id
         heads_delivered = len(chunks) > 1
+        notification_delivered = False
         for chunk in chunks[:-1]:
-            new_id = await self._send_new_chunk(chunk, reply_to, final=tick.got_done)
+            notify_this_chunk = tick.got_done and not notification_delivered
+            new_id = await self._send_new_chunk(chunk, reply_to, final=notify_this_chunk)
             if new_id is None or new_id == reply_to:
                 heads_delivered = False  # keep the full text intact for the gateway fallback
                 break
+            if notify_this_chunk:
+                notification_delivered = True
             reply_to = new_id
 
         if heads_delivered:
@@ -748,9 +761,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._last_edit_time = time.monotonic()
         if tick.got_done:
             tail_delivered = (not self._accumulated
-                              or await self._send_or_edit(self._accumulated, finalize=True))
-            # ``_already_sent`` may be True from prior state — only heads + tail count.
-            self._final_response_sent = heads_delivered and tail_delivered
+                              or await self._send_or_edit(
+                                  self._accumulated,
+                                  finalize=True,
+                                  is_turn_final=not notification_delivered,
+                              ))
+            # If no head was sealed, the successful tail send still carried the full
+            # response. If heads were sealed, heads + tail cover the same ledger.
+            self._final_response_sent = tail_delivered
             if self._final_response_sent:
                 self._turn_split_delivery = True
                 self._mark_final_delivered(record=self._accumulated)
