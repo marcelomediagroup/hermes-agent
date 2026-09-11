@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import inspect
 import json
 import logging
 import time
@@ -339,10 +340,33 @@ class GatewayNotificationsMixin:
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await stream_consumer._edit_message(
-                            message_id=_sc_msg_id, content=text_content,
-                            finalize=True, notify=True,
-                        )
+                        _consumer_edit = getattr(stream_consumer, "_edit_message", None)
+                        if callable(_consumer_edit):
+                            _edit_res = await _consumer_edit(
+                                message_id=_sc_msg_id, content=text_content,
+                                finalize=True, notify=True,
+                            )
+                        else:
+                            # Compatibility for adapters/tests that expose the sealed
+                            # message id without the transport helper. Production
+                            # consumers take the branch above so connector-specific
+                            # routing metadata still comes from the consumer.
+                            _edit_kwargs = {
+                                "chat_id": source.chat_id,
+                                "message_id": _sc_msg_id,
+                                "content": text_content,
+                                "finalize": True,
+                            }
+                            try:
+                                _edit_params = inspect.signature(adapter.edit_message).parameters
+                                if "metadata" in _edit_params or any(
+                                    param.kind is inspect.Parameter.VAR_KEYWORD
+                                    for param in _edit_params.values()
+                                ):
+                                    _edit_kwargs["metadata"] = _mark_notify_metadata(metadata)
+                            except (TypeError, ValueError):
+                                pass
+                            _edit_res = await adapter.edit_message(**_edit_kwargs)
                         if getattr(_edit_res, "success", False):
                             _reconciled = True
                             logger.info(
