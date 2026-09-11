@@ -1,6 +1,6 @@
 # Required-child completion barrier — verification receipt
 
-Base: `f17f18cd11e0dc203e683ab2b77b6a5aafe5afa7`  
+Base: `f17f18cd11e0dc203e683ab2b77b6a5aafe5afa7`
 Branch: `mmg/completion-enforcement-20260908`
 
 ## Contract
