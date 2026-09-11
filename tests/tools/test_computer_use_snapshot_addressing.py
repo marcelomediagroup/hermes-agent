@@ -121,6 +121,10 @@ def test_capture_handle_reaches_each_native_action(native, addressing, action, e
         assert not result["ok"] and result["code"] == "button_unsupported", result
         assert len(transport.calls) == previous_calls
         return
+    if addressing == "legacy":
+        assert not result["ok"] and result["code"] == "snapshot_binding_required", result
+        assert len(transport.calls) == previous_calls
+        return
     assert result["ok"], result
     name, payload = transport.calls[-1]
     assert payload["element_index"] == index
@@ -131,8 +135,6 @@ def test_capture_handle_reaches_each_native_action(native, addressing, action, e
         assert payload["element_token"] == f"{transport.snapshot}:{index}"
     elif addressing == "snapshot":
         assert payload["snapshot_id"] == transport.snapshot
-    else:
-        assert not {"snapshot_id", "element_token"} & payload.keys()
     assert result["verdict"]["decision"] == "verify_fresh_state"
     assert result["verified"] is False
 

@@ -121,6 +121,7 @@ def test_parent_yields_until_required_result_is_in_resuming_turn(runtime, monkey
             async def handle_message(synth_event):
                 assert synth_event.internal is True
                 assert synth_event.metadata["gateway_session_id"] == agent.session_id
+                synth_event._gateway_accepted = True
                 # Exercise the real gateway-owned executor, not asyncio.to_thread
                 # standing in for the production ContextVar handoff.
                 await runner._run_in_executor_with_context(
@@ -128,7 +129,7 @@ def test_parent_yields_until_required_result_is_in_resuming_turn(runtime, monkey
 
             source = SimpleNamespace(platform="telegram", chat_id="chat", thread_id=None)
             runner._build_process_event_source = lambda _evt: source
-            runner._resolve_injection_adapter = lambda _platform: SimpleNamespace(
+            runner._resolve_injection_adapter = lambda _platform, _source=None: SimpleNamespace(
                 supports_async_delivery=True, handle_message=handle_message)
             try:
                 if delivery_path == "gateway_group":
