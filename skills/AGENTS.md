@@ -1,75 +1,68 @@
-# skills/ + optional-skills/ — bundled skills, authoring standards, curator
+# Skills and Optional Skills
 
-Applies on top of the root `AGENTS.md`. Long-form: `website/docs/developer-guide/creating-skills.md`;
-user docs: `website/docs/user-guide/features/skills.md`, `curator.md`.
+Applies with the repository root instructions. User documentation lives in
+`website/docs/user-guide/features/skills.md`; deeper implementation guidance
+lives in `website/docs/developer-guide/creating-skills.md`.
 
-## Two surfaces
+## Placement
 
-- **`skills/`** — built-in, loadable by default, organised by category (`skills/github/`, `skills/mlops/`).
-- **`optional-skills/`** — heavier/niche skills shipped but NOT active; installed via
-  `hermes skills install official/<category>/<skill>` (adapter `tools/skills_hub_official.py`
-  `OptionalSkillSource`). Categories: `autonomous-ai-agents, blockchain, communication, creative,
-  devops, email, health, mcp, migration, mlops, productivity, research, security, web-development`.
+- `skills/` contains small, broadly useful built-ins.
+- `optional-skills/` contains niche, heavy, or dependency-specific packages.
+- Custom user capabilities normally belong in a plugin or profile-local skill,
+  not the core repository.
 
-Reviewing a skill PR: check the target directory — heavy-dep or niche skills go to `optional-skills/`.
+## Authoring Contract
 
-## SKILL.md frontmatter
+Every new or materially revised skill must have valid YAML frontmatter with
+`name`, `description`, `version`, `author`, `license`, `platforms`, and Hermes
+tags.
 
-`name`, `description`, `version`, `author`, `license`, `platforms` (OS gate: `[macos]`,
-`[linux, macos]`, ...), `metadata.hermes.tags`, `metadata.hermes.category`,
-`metadata.hermes.related_skills`, `metadata.hermes.config` (config.yaml settings the skill needs —
-stored under `skills.config.<key>`, prompted during setup, injected at load). Top-level `tags:` /
-`category:` are accepted and mirrored from `metadata.hermes.*` by the loader.
+- `name` is lowercase kebab-case and matches the package directory.
+- `description` is one sentence, at most 60 characters, and starts with
+  `Use when`, `Use for`, or `Use to`. Put the applicability signal first because
+  the prompt index truncates after 60 characters.
+- Describe the task boundary, not implementation details or marketing claims.
+- Declare real platform restrictions and prerequisites. Prefer portable helpers
+  before narrowing platform support.
+- Credit the human contributor before “Hermes Agent”.
 
-## Authoring standards (HARDLINE — enforced by `tests/skills/test_authoring_standards.py`)
+## Progressive Disclosure
 
-Every new or modernised skill — bundled, optional, or contributed — meets all of these before merge:
+`SKILL.md` is a router, not a complete manual. Keep only:
 
-1. **`description` ≤ 60 chars, one sentence, ends with a period.** Long descriptions bloat listings
-   and dilute attention when many skills load. State the capability, not the implementation; no
-   marketing words ("powerful", "comprehensive", "seamless", "advanced"); don't repeat the name.
-   Check: `len(re.search(r'^description: (.*)$', text, re.M).group(1)) <= 60`.
-2. **Prose references native Hermes tools or the MCP servers the skill expects, in backticks**
-   (`terminal`, `web_extract`, `read_file`, `patch`, `search_files`, `vision_analyze`,
-   `browser_navigate`, `delegate_task`). Never name shell utilities the agent has wrapped: `grep` →
-   `search_files`, `cat`/`head`/`tail` → `read_file`, `sed`/`awk` → `patch`, `find`/`ls` →
-   `search_files target='files'`. MCP dependencies are named with setup in `## Prerequisites`.
-   Third-party CLIs and pipelines are fine inside script files, not as the headline surface.
-3. **`platforms:` gating is audited against actual script imports.** POSIX-only primitives
-   (`fcntl`, `termios`, `os.setsid`, `os.kill(pid, 0)`, `/proc`, hardcoded `/tmp`, `signal.SIGKILL`,
-   bash heredocs, `osascript`, `apt`, `systemctl`) require a platform declaration. Fix cross-platform
-   first (`tempfile.gettempdir`, `pathlib.Path`, `psutil.pid_exists`, Python filtering instead of
-   `grep`); gate narrower only when the dependency is genuinely platform-bound.
-4. **`author` credits the human first.** External contributor's real name + GitHub handle first,
-   "Hermes Agent" second. A commit authored as "Hermes Agent" (they drafted with Hermes) is replaced
-   with the human's name — credit the human, not the tool.
-5. **Modern section order:** `# <Skill> Skill`, 2–3 sentence intro (what it does and doesn't),
-   `## When to Use`, `## Prerequisites`, `## How to Run`, `## Quick Reference`, `## Procedure`,
-   `## Pitfalls`, `## Verification`. ~200 lines for a complex skill, ~100 simple. Cut intro fluff,
-   marketing prose, and env-var re-explanations already in Prerequisites.
-6. **`scripts/`, `references/`, `templates/`.** Don't make the model inline-write parsers or
-   non-trivial logic every call — ship a helper script and reference it by skill-relative path.
-7. **Tests at `tests/skills/test_<skill>_skill.py`**, stdlib + pytest + `unittest.mock` only, no
-   live network. Run `scripts/run_tests.sh tests/skills/test_<skill>_skill.py -q`.
-8. **`.env.example` additions sit in a clearly delimited block.** Contributor copies of the file are
-   usually stale; edits outside the skill's own block are dropped during salvage.
+- when the skill applies and important non-triggers;
+- the intended outcome and durable decision points;
+- prerequisites that affect whether work can proceed;
+- links to the exact reference, script, template, or asset needed next;
+- concise verification and safety boundaries.
 
-No `offset`/`limit` pagination on skill-loading tools — the agent must read a skill fully (root).
-The salvage/modernisation checklist for external skill PRs is `references/new-skill-pr-salvage.md`
-in the `hermes-agent-dev` skill.
+Move detailed recipes, command catalogs, examples, and historical troubleshooting
+into `references/`. Put deterministic or repeated logic in `scripts/`; do not ask
+the model to reproduce a parser or long transformation inline. Load supporting
+files only when the current task needs them.
 
-## Curator (skill lifecycle)
+Do not require a fixed heading itinerary or target line count. A root over roughly
+8 KB deserves review for routing opportunities, but clarity and task safety—not a
+numeric limit—decide the final structure.
 
-Background maintenance that tracks usage on agent-created skills and auto-archives stale ones;
-archives go to `~/.hermes/skills/.archive/` and are restorable. Core `agent/curator.py` (review
-loop, auto-transitions, LLM review prompt) + `agent/curator_backup.py` (pre-run tar.gz snapshots);
-CLI `hermes_cli/curator.py` → `hermes curator status|run|pause|resume|pin|unpin|archive|restore|
-prune|backup|rollback`; telemetry `tools/skill_usage.py` owns `~/.hermes/skills/.usage.json`
-(`use_count`, `view_count`, `patch_count`, `last_activity_at`, `state` active/stale/archived,
-`pinned`). Config `curator:` — `enabled, interval_hours, min_idle_hours, stale_after_days,
-archive_after_days, backup.*`; its LLM calls route through `auxiliary` (`agent/AGENTS.md`).
+## Tools and Dependencies
 
-Invariants: touches only `created_by: "agent"` skills (bundled + hub-installed are off-limits);
-never deletes — archive is the maximum; pinned skills are exempt from every auto-transition and
-the LLM review; `skill_manage(action="delete")` refuses pinned skills while patch/edit/write_file/
-remove_file still work so the agent can keep improving them.
+Use native Hermes tool names in prose. Third-party CLIs are appropriate inside a
+script or an explicit prerequisite. MCP dependencies must name the server and the
+readiness check. Keep environment examples free of real credentials.
+
+## Verification
+
+- Add the smallest behavior test that exercises a new skill contract.
+- Run `scripts/run_tests.sh tests/skills/test_<skill>_skill.py -q` for a targeted
+  skill test, plus broader skill-authoring checks when shared rules change.
+- Do not add source-shape or fixed-count tests.
+- Skill-loading tools return the full root; do not add offset pagination to
+  `skill_view`. References remain individually addressable by path.
+
+## Curator Boundary
+
+The background curator may maintain only skills marked `created_by: agent`.
+Bundled and hub-installed skills are read-only to it. Archiving is recoverable;
+pinned skills are exempt. Repository-owned skill cleanup belongs in reviewed
+source changes and deterministic validation, not autonomous curation.

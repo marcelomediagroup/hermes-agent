@@ -12,7 +12,10 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-_SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
+_SKILLS_BLOCK_RE = re.compile(
+    r"<(?P<tag>available_skills|available_skill_categories)>.*?</(?P=tag)>",
+    re.DOTALL,
+)
 
 # A rendered skill entry is ``    - name: desc`` (or ``    - name``); category headers use two
 # leading spaces, so the four-space + ``- `` prefix isolates skill lines.
@@ -20,6 +23,7 @@ _SKILL_LINE_PREFIX = "    - "
 
 # Posture-demoted categories render all visible skill names on one shared line.
 _NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
+_ROUTER_NAMES_LINE_RE = re.compile(r"^    names: (?P<names>.+)$")
 
 # Cap the human-readable "Skills by size" table; ``--json`` always has them all.
 _SKILLS_TABLE_LIMIT = 20
@@ -110,7 +114,8 @@ def _compute_skills_breakdown(skills_block: str) -> List[Dict[str, Any]]:
 
     for line in skills_block.splitlines():
         line_bytes = _bytes(line)
-        if (compact_match := _NAMES_ONLY_LINE_RE.match(line)) is not None:
+        compact_match = _NAMES_ONLY_LINE_RE.match(line) or _ROUTER_NAMES_LINE_RE.match(line)
+        if compact_match is not None:
             names = [n.strip() for n in compact_match.group("names").split(",") if n.strip()]
             name_bytes = [_bytes(name) for name in names]
             shared_base, shared_remainder = divmod(line_bytes - sum(name_bytes), len(names)) if names else (0, 0)

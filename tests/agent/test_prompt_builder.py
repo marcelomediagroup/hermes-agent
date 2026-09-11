@@ -345,6 +345,22 @@ class TestBuildSkillsSystemPrompt:
         full = build_skills_system_prompt()
         assert "Write threads" in full
 
+    def test_router_index_keeps_names_but_defers_descriptions(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skill_dir = tmp_path / "skills" / "devops" / "cloudflare-dns"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: cloudflare-dns\ndescription: Use when changing Cloudflare DNS records.\n---\n"
+        )
+
+        router = build_skills_system_prompt(index_mode="router")
+        full = build_skills_system_prompt(index_mode="full")
+
+        assert "skills_list(query=" in router
+        assert "cloudflare-dns" in router
+        assert "changing Cloudflare DNS records" not in router
+        assert "changing Cloudflare DNS records" in full
+
 
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):

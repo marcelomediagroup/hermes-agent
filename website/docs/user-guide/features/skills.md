@@ -97,9 +97,10 @@ hermes chat --toolsets skills -q "Show me the axolotl skill"
 reference material — into a reusable skill, without hand-writing the
 `SKILL.md`. It is open-ended: point it at *anything you can describe* and the
 agent gathers the material with the tools it already has, then authors a skill
-that follows the [house authoring standards](#skillmd-format) (≤60-char
-description, the standard section order, Hermes-tool framing, no invented
-commands).
+that follows the [house authoring standards](#skillmd-format): a concise,
+trigger-first description; a small task router; focused references and scripts;
+Hermes-tool framing; and no invented commands. The root has no mandatory
+heading itinerary.
 
 ```bash
 # A local SDK or doc directory — read with read_file / search_files
@@ -151,19 +152,22 @@ applies if you have it on.
 Skills use a token-efficient loading pattern:
 
 ```
-Level 0: skills_list()           → [{name, description, category}, ...]   (~3k tokens)
+Level 0: skills_list(query=...)  → ranked [{name, description, category}, ...]
 Level 1: skill_view(name)        → Full content + metadata       (varies)
 Level 2: skill_view(name, path)  → Specific reference file       (varies)
 ```
 
-The agent only loads the full skill content when it actually needs it.
+With `skills.prompt_index: router`, the system prompt carries only categories
+and names. The agent searches the catalog with a short query, loads the root for
+the precise match, and then opens only the referenced material needed for the
+task. Exact slash-command invocation bypasses search.
 
 ## SKILL.md Format
 
 ```markdown
 ---
 name: my-skill
-description: Brief description of what this skill does
+description: Use when the task needs this workflow.
 version: 1.0.0
 platforms: [macos, linux]     # Optional — restrict to specific OS platforms
 metadata:
@@ -181,18 +185,17 @@ metadata:
 
 # Skill Title
 
-## When to Use
-Trigger conditions for this skill.
+State the trigger, non-triggers, intended outcome, and prerequisites that affect
+execution. Keep the root as a router and link detailed procedures or examples
+from the point where they become relevant.
 
-## Procedure
-1. Step one
-2. Step two
+## Routes
+- For one task shape, read `references/one.md`.
+- For another task shape, read `references/two.md`.
 
-## Pitfalls
-- Known failure modes and fixes
-
-## Verification
-How to confirm it worked.
+## Durable checks
+- Verify the result that matters.
+- Report unresolved dependencies precisely.
 ```
 
 ### Platform-Specific Skills

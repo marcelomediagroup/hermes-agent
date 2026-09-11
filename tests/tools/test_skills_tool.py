@@ -22,7 +22,8 @@ from tools.skills_tool import (
 
 
 def _make_skill(
-    skills_dir, name, frontmatter_extra="", body="Step 1: Do the thing.", category=None
+    skills_dir, name, frontmatter_extra="", body="Step 1: Do the thing.", category=None,
+    description=None,
 ):
     """Helper to create a minimal skill directory."""
     if category:
@@ -33,7 +34,7 @@ def _make_skill(
     content = f"""\
 ---
 name: {name}
-description: Description for {name}.
+description: {description or f'Description for {name}.'}
 {frontmatter_extra}---
 
 # {name}
@@ -277,6 +278,63 @@ class TestSkillsList:
         assert all_result["count"] == 2
         assert filtered["count"] == 1
         assert filtered["skills"][0]["name"] == "skill-a"
+
+    def test_query_ranks_name_then_description_and_applies_default_limit(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "cloudflare-dns", category="devops")
+            _make_skill(
+                tmp_path,
+                "edge-routing",
+                category="devops",
+                description="Use when changing Cloudflare DNS records.",
+            )
+            for index in range(12):
+                _make_skill(
+                    tmp_path,
+                    f"dns-helper-{index}",
+                    category="devops",
+                    description="Use for DNS maintenance.",
+                )
+            result = json.loads(skills_list(query="cloudflare dns"))
+
+        assert result["success"] is True
+        assert result["count"] == 10
+        assert result["total_matches"] == 14
+        assert result["skills"][0]["name"] == "cloudflare-dns"
+
+    def test_query_and_category_can_be_combined_with_explicit_limit(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(tmp_path, "dns-devops", category="devops", description="Use for DNS changes.")
+            _make_skill(tmp_path, "dns-research", category="research", description="Use for DNS research.")
+            result = json.loads(skills_list(category="research", query="dns", limit=1))
+
+        assert result["count"] == 1
+        assert result["total_matches"] == 1
+        assert result["skills"][0]["name"] == "dns-research"
+
+    def test_invalid_limit_is_rejected(self):
+        result = json.loads(skills_list(query="dns", limit=0))
+        assert result["success"] is False
+
+    def test_does_not_expose_editorial_copy_to_the_agent(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "polished-skill",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    editorial_name: Polished Skill\n"
+                    "    editorial_description: Human-facing copy.\n"
+                ),
+            )
+            skill = json.loads(skills_list())["skills"][0]
+
+        assert skill == {
+            "name": "polished-skill",
+            "description": "Description for polished-skill.",
+            "category": None,
+        }
 
     def test_category_filter_finds_symlinked_category(self, tmp_path):
         external_root = tmp_path / "repo"

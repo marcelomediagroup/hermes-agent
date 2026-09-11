@@ -297,8 +297,12 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
 
 
 def _skills_prompt(agent: Any) -> str:
-    """Skills index (empty without skills tools).  Focus mode demotes non-coding
-    categories to names-only — never hidden, every name stays visible."""
+    """Skills index (empty without skills tools).
+
+    ``skills.prompt_index=auto`` uses the searchable router for Astra and the
+    legacy full catalog for other model families. Profiles may explicitly set
+    ``router`` or ``full`` for controlled rollout and rollback.
+    """
     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
     import model_tools
@@ -308,8 +312,22 @@ def _skills_prompt(agent: Any) -> str:
         _compact_cats = coding_compact_skill_categories(platform=agent.platform, cwd=resolve_context_cwd())
     except Exception:
         _compact_cats = frozenset()
+    try:
+        from agent.reasoning_effort import is_astra_model
+        from hermes_cli.config import load_config_readonly
+
+        skills_cfg = load_config_readonly().get("skills") or {}
+        _index_mode = str(skills_cfg.get("prompt_index") or "auto").strip().lower()
+        if _index_mode == "auto":
+            _index_mode = "router" if is_astra_model(getattr(agent, "model", "")) else "full"
+        elif _index_mode not in {"router", "full"}:
+            logger.warning("Unknown skills.prompt_index=%r; using full", _index_mode)
+            _index_mode = "full"
+    except Exception:
+        _index_mode = "full"
     return _pb.build_skills_system_prompt(available_tools=agent.valid_tool_names, available_toolsets=avail_toolsets,
-                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent))
+                                         compact_categories=_compact_cats or None, skills_dir_override=_agent_skills_dir(agent),
+                                         index_mode=_index_mode)
 
 
 def _bot_mode_parts(agent: Any) -> List[str]:
@@ -624,7 +642,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     skills_prompt = _skills_prompt(agent)
     # Skill-pointer variant requires BOTH skill_view AND the hermes-agent skill
     # in the rendered index (pure string check — inherits the index's stability).
-    if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
+    if "skill_view" in (agent.valid_tool_names or set()) and "hermes-agent" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
     stable_parts.extend(_alibaba_identity_part(agent))
     # Coding posture: the operating brief stays in the stable prefix. The
