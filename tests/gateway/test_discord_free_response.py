@@ -351,11 +351,6 @@ async def test_auto_thread_setting_is_isolated_between_profile_adapters(
 ):
     """Each profile's config must win over process-global bridge state."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
-    monkeypatch.setattr(
-        discord_platform,
-        "_profile_scoped_config_load",
-        lambda: True,
-    )
 
     inline_extra = discord_platform._apply_yaml_config(
         {}, {"auto_thread": False}
@@ -466,7 +461,7 @@ def test_discord_threaded_free_response_config_loads_end_to_end(
     discord_config = loaded.platforms[Platform.DISCORD]
     loaded_adapter = DiscordAdapter(discord_config)
 
-    assert discord_config.extra["threaded_free_response_channels"] == "789,790"
+    assert discord_config.extra["threaded_free_response_channels"] == ["789", "790"]
     assert loaded_adapter._discord_threaded_free_response_channels() == {
         "789",
         "790",
@@ -1165,4 +1160,3 @@ class TestNonConversationalTrackerOffload:
             await _asyncio.gather(first, second)
 
         assert sorted(writes[-1]) == ["1", "2"]
-

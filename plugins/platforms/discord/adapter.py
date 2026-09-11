@@ -268,7 +268,7 @@ from gateway.platforms.base import (
 )
 from gateway.platforms.event import MessageEvent, MessageType, ProcessingOutcome
 from tools.url_safety import is_safe_url
-from gateway.platforms._shared import profile_scoped as _profile_scoped_config_load
+from gateway.platforms._shared import yaml_env_setter as _yaml_env_setter
 
 
 async def _read_url_image_with_redirect_guard(
@@ -611,22 +611,22 @@ def check_discord_requirements() -> bool:
 
 
 def _setting_bool(env_name: str, configured: Any, default: bool) -> bool:
-    """Resolve a boolean with explicit env override over instance config."""
+    """Resolve a profile-owned boolean, with env as the legacy fallback."""
+    if configured is not None and configured != "":
+        if isinstance(configured, bool):
+            return configured
+        return str(configured).strip().lower() in {"true", "1", "yes", "on"}
     raw = os.getenv(env_name, "").strip().lower()
     if raw:
         return raw in {"true", "1", "yes", "on"}
-    if configured is None or configured == "":
-        return default
-    if isinstance(configured, bool):
-        return configured
-    return str(configured).strip().lower() in {"true", "1", "yes", "on"}
+    return default
 
 
 def _build_allowed_mentions(
     *, configured: Optional[Dict[str, Any]] = None,
     mention_user_on_final: Optional[bool] = None,
 ):
-    """Build safe Discord mention policy with env-over-instance precedence."""
+    """Build safe Discord mention policy with profile config ahead of legacy env."""
     if not DISCORD_AVAILABLE:
         return None
     configured = configured if isinstance(configured, dict) else {}
@@ -2803,8 +2803,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             return False
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
-        return os.getenv("DISCORD_REACTIONS", "true").lower() not in {"false", "0", "no"}
+        """Reactions enabled via ``extra.reactions`` (YAML, per profile) or ``DISCORD_REACTIONS``."""
+        return self._extra_or_env_flag("reactions", "DISCORD_REACTIONS", "true", truthy=False)
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Add an in-progress reaction and record durable handling state."""
@@ -4619,7 +4619,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Boolean from ``config.extra[key]`` (str parsed permissively) else ``env_key``.
         ``truthy=True`` env values must be in {true,1,yes,on}; ``truthy=False`` env values are on
         unless in {false,0,no,off} — matching each flag's historical default shape."""
-        configured = self.config.extra.get(key)
+        extra = getattr(self.config, "extra", None)
+        configured = extra.get(key) if isinstance(extra, dict) else None
         if configured is not None:
             if isinstance(configured, str):
                 return configured.lower() not in {"false", "0", "no", "off"}
@@ -4757,7 +4758,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     def _get_allow_bots(self) -> str:
         """Per-profile DISCORD_ALLOW_BOTS mode (none|mentions|all)."""
-        return self._gate_env("DISCORD_ALLOW_BOTS", "none").lower().strip() or "none"
+        raw = self._gate_raw("allow_bots", "DISCORD_ALLOW_BOTS")
+        return str(raw or "none").lower().strip() or "none"
 
     def _discord_free_response_channels(self) -> set:
         """Channel IDs/names needing no mention; a lone "*" is preserved for wildcard short-circuit."""
@@ -4871,10 +4873,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
-        configured = self.config.extra.get("history_backfill")
-        if configured is not None:
-            return self._extra_or_env_flag("history_backfill", "DISCORD_HISTORY_BACKFILL", "true", truthy=True)
-        return os.getenv("DISCORD_HISTORY_BACKFILL", "true").lower() in {"true", "1", "yes"}
+        return self._extra_or_env_flag("history_backfill", "DISCORD_HISTORY_BACKFILL", "true", truthy=True)
 
     def _discord_history_backfill_limit(self) -> int:
         """Max messages scanned backwards; a safety cap since scans usually stop at the bot's last message."""
@@ -5300,7 +5299,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _approval_mention_content(self) -> Optional[str]:
         """User mentions for approval prompts, gated on ``discord.approval_mentions``
         (``DISCORD_APPROVAL_MENTIONS``). Only numeric allowlist entries; default off."""
-        if not _env_bool("DISCORD_APPROVAL_MENTIONS", False):
+        if not self._extra_or_env_flag("approval_mentions", "DISCORD_APPROVAL_MENTIONS", "false", truthy=True):
             return None
         user_ids = sorted(uid for uid in self._allowed_user_ids if str(uid).isdigit())
         if not user_ids:
@@ -7067,16 +7066,18 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     Implements the ``apply_yaml_config_fn`` contract (#24836). Mirrors the legacy ``discord_cfg`` block that
     used to live in ``gateway/config.py::load_gateway_config()`` before this migration.
     """
-    def _env_default(env_key: str, value) -> None:
-        # First-writer-wins: an explicit env var always beats the YAML value.
-        if not os.getenv(env_key):
-            os.environ[env_key] = value
+    # Every env write is first-writer-wins (an explicit env var beats YAML) and is skipped for a
+    # profile-scoped multiplex load: a secondary profile's settings must never land in process-global
+    # env where they'd become another profile's policy (#72348). Everything is seeded into extra too.
+    _env_default = _yaml_env_setter()
 
     def _csv(value) -> str:
         return ",".join(str(v) for v in value) if isinstance(value, list) else str(value)
 
+    seeded_extra = {}
     for key, env_key in _YAML_BOOL_ENV_KEYS:
         if key in discord_cfg:
+            seeded_extra[key] = discord_cfg[key]  # original type: the shared-key loop seeds bools as bools
             _env_default(env_key, str(discord_cfg[key]).lower())
     platforms_cfg = yaml_cfg.get("platforms")
     platform_extra_cfg = {}
@@ -7086,13 +7087,6 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             candidate_extra = discord_platform_cfg.get("extra")
             if isinstance(candidate_extra, dict):
                 platform_extra_cfg = candidate_extra
-    seeded_extra = {}
-    # Gate keys are ALWAYS seeded into PlatformConfig.extra (per-profile lists); the os.environ writes
-    # below are first-writer-wins for legacy consumers and skipped for profile-scoped multiplex loads.
-    # The os.environ writes below remain first-writer-wins for legacy env-only consumers, but are skipped
-    # for profile-scoped loads under multiplex — a secondary profile's gates must never land in
-    # process-global env where they'd become another profile's policy. See #72348.
-    _skip_env_bridge = _profile_scoped_config_load()
 
     def _gate(key: str, env_key: str, *, from_platform_extra: bool, lower: bool = False) -> None:
         value = discord_cfg[key] if key in discord_cfg else (platform_extra_cfg.get(key) if from_platform_extra else None)
@@ -7100,48 +7094,28 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             return
         text = str(value).lower() if lower else _csv(value)
         seeded_extra[key] = text
-        if not _skip_env_bridge:
-            _env_default(env_key, text)
+        _env_default(env_key, text)
 
     _gate("allow_from", "DISCORD_ALLOWED_USERS", from_platform_extra=True)
     _gate("allowed_roles", "DISCORD_ALLOWED_ROLES", from_platform_extra=True)
     _gate("allow_all_users", "DISCORD_ALLOW_ALL_USERS", from_platform_extra=True, lower=True)
+    _gate("allow_bots", "DISCORD_ALLOW_BOTS", from_platform_extra=True, lower=True)
     approval_mentions_cfg = (
         discord_cfg["approval_mentions"] if "approval_mentions" in discord_cfg
         else platform_extra_cfg.get("approval_mentions")
     )
     if approval_mentions_cfg is not None:
+        seeded_extra["approval_mentions"] = approval_mentions_cfg
         _env_default("DISCORD_APPROVAL_MENTIONS", str(approval_mentions_cfg).lower())
-
-    def _seed_channel_scopes(
-        config_key: str,
-        legacy_env_key: str | None = None,
-    ) -> None:
-        configured_scopes = discord_cfg.get(config_key)
-        if configured_scopes is None:
-            return
-        if isinstance(configured_scopes, list):
-            configured_scopes = ",".join(str(value) for value in configured_scopes)
-        normalized_scopes = str(configured_scopes)
-        seeded_extra[config_key] = normalized_scopes
-        if (
-            legacy_env_key
-            and not _skip_env_bridge
-            and not os.getenv(legacy_env_key)
-        ):
-            os.environ[legacy_env_key] = normalized_scopes
-
-    _seed_channel_scopes(
-        "free_response_channels",
-        "DISCORD_FREE_RESPONSE_CHANNELS",
-    )
-    _seed_channel_scopes("threaded_free_response_channels")
-    if "auto_thread" in discord_cfg:
-        seeded_extra["auto_thread"] = discord_cfg["auto_thread"]
-        if not _skip_env_bridge:
-            _env_default("DISCORD_AUTO_THREAD", str(discord_cfg["auto_thread"]).lower())
-    if "reactions" in discord_cfg and not _skip_env_bridge:
-        _env_default("DISCORD_REACTIONS", str(discord_cfg["reactions"]).lower())
+    _gate("free_response_channels", "DISCORD_FREE_RESPONSE_CHANNELS", from_platform_extra=False)
+    if "threaded_free_response_channels" in discord_cfg:
+        seeded_extra["threaded_free_response_channels"] = discord_cfg[
+            "threaded_free_response_channels"
+        ]
+    for key, env_key in (("auto_thread", "DISCORD_AUTO_THREAD"), ("reactions", "DISCORD_REACTIONS")):
+        if key in discord_cfg:
+            seeded_extra[key] = discord_cfg[key]
+            _env_default(env_key, str(discord_cfg[key]).lower())
     backfill_cfg = discord_cfg.get("missed_message_backfill")
     if isinstance(backfill_cfg, dict):
         seeded_extra["missed_message_backfill"] = dict(backfill_cfg)
@@ -7150,14 +7124,16 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     _gate("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS", from_platform_extra=False)
     # history_backfill: recover mention-gated channel messages between bot turns.
     if "history_backfill" in discord_cfg:
+        seeded_extra["history_backfill"] = discord_cfg["history_backfill"]
         _env_default("DISCORD_HISTORY_BACKFILL", str(discord_cfg["history_backfill"]).lower())
     hbl = discord_cfg.get("history_backfill_limit")
     if hbl is not None:
+        seeded_extra["history_backfill_limit"] = hbl
         _env_default("DISCORD_HISTORY_BACKFILL_LIMIT", str(hbl))
     if "mention_user_on_final" in discord_cfg:
         seeded_extra["mention_user_on_final"] = discord_cfg["mention_user_on_final"]
     # Mention policy stays instance-owned so multiplexed profiles cannot leak
-    # through process-global environment bridges. Explicit env still overrides.
+    # through process-global environment bridges. Legacy env is a fallback.
     allow_mentions_cfg = discord_cfg.get("allow_mentions")
     if isinstance(allow_mentions_cfg, dict):
         seeded_extra["allow_mentions"] = dict(allow_mentions_cfg)
@@ -7175,8 +7151,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             value = _websocket_liveness_cfg.get(legacy_key)
         if value is not None:
             seeded_extra[primary_key] = value
-            if env_key and not os.getenv(env_key):
-                os.environ[env_key] = str(value)
+            if env_key:
+                _env_default(env_key, str(value))
     return seeded_extra or None
 
 
