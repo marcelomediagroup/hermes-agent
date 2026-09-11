@@ -462,10 +462,12 @@ class InProcessCronScheduler(CronScheduler):
         )
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
 
+        profile_homes = list(profile_homes)
+        live_homes = _existing_profile_homes(profile_homes)
         logger.info(
             "Multiplex cron scheduler started for %d profile(s): %s",
-            len(profile_homes),
-            [p[0] if isinstance(p, tuple) else p for p in profile_homes],
+            len(live_homes),
+            [p[0] if isinstance(p, tuple) else p for p in live_homes],
         )
 
         def tick_adapters_for(profile_name):
@@ -482,7 +484,7 @@ class InProcessCronScheduler(CronScheduler):
         # Recovery + heartbeat per profile; one broken store must not abort startup for the others.
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
-        for entry in _existing_profile_homes(profile_homes):
+        for entry in live_homes:
             _, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):

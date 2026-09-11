@@ -190,6 +190,35 @@ def test_inprocess_provider_ticks_and_stops():
     assert calls[0].get("sync") is False
 
 
+def test_multiplex_scheduler_does_not_recreate_deleted_profile(tmp_path, monkeypatch):
+    """A profile deleted after Desktop starts must stay deleted.
+
+    Desktop snapshots the served profile homes when it starts its multiplexed
+    cron ticker. A later profile deletion removes the directory while that
+    snapshot remains live, so every cron-store access must ignore stale homes
+    instead of recreating ``<profile>/cron``.
+    """
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    active = tmp_path / "active"
+    active.mkdir()
+    deleted = tmp_path / "deleted"
+    stop = threading.Event()
+    stop.set()
+
+    provider = InProcessCronScheduler()
+    monkeypatch.setattr(provider, "recover_interrupted", lambda: 0)
+
+    provider._start_multiplex(
+        stop,
+        profile_homes=[("active", active), ("deleted", deleted)],
+        interval=0,
+    )
+
+    assert (active / "cron").is_dir()
+    assert not deleted.exists()
+
+
 # ── Phase 2: config key, discovery, resolver ─────────────────────────────────
 
 
