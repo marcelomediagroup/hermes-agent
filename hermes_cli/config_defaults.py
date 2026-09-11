@@ -1324,6 +1324,10 @@ DEFAULT_CONFIG = {
     # and resolved; read-only — creation goes to ~/.hermes/skills/ unless create_dir redirects it.
     "skills": {
         "external_dirs": [],   # e.g. ["~/.agents/skills", "/shared/team-skills"]
+        # "auto" uses a names/categories router for Astra and the legacy full
+        # description catalog for other model families. "router" and "full"
+        # provide explicit rollout/rollback control.
+        "prompt_index": "auto",
         # Where skill_manage-created skills go (empty = profile-local dir). When set, new skills
         # land here AND agent-facing instructions name this path; expanded (~, ${VAR}), relative to
         # HERMES_HOME, scanned alongside the local dir.

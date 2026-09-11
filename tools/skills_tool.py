@@ -7,6 +7,7 @@ linked files. Sibling modules (skills_tool_setup / _plugin / _dedup) re-export h
 import json
 import logging
 import os
+import re
 import time
 from contextlib import suppress
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -234,9 +235,52 @@ def _sort_skills(skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(skills, key=lambda s: (s.get("category") or "", s["name"]))
 
 
-def skills_list(category: str = None, task_id: str = None) -> str:
-    """Tier 1 listing: name + description (+ category) only; ``task_id`` is handler parity."""
+_SKILL_SEARCH_TOKEN_RE = re.compile(r"[a-z0-9]+")
+_SKILL_SEARCH_STOPWORDS = frozenset({
+    "a", "an", "and", "for", "help", "in", "me", "of", "on", "please", "task", "the", "to", "use", "with",
+})
+
+
+def _skill_search_score(skill: Dict[str, Any], query: str) -> int:
+    """Deterministic lexical relevance for the small local skill catalog."""
+    normalized = " ".join(_SKILL_SEARCH_TOKEN_RE.findall(query.lower()))
+    if not normalized:
+        return 0
+    name = str(skill.get("name") or "").lower()
+    category = str(skill.get("category") or "").lower()
+    description = str(skill.get("description") or "").lower()
+    searchable = f"{name} {category} {description}"
+    if normalized == " ".join(_SKILL_SEARCH_TOKEN_RE.findall(name)):
+        return 10_000
+    tokens = [token for token in normalized.split() if token not in _SKILL_SEARCH_STOPWORDS]
+    if not tokens:
+        tokens = normalized.split()
+    score = 0
+    if normalized in searchable:
+        score += 500
+    name_tokens = set(_SKILL_SEARCH_TOKEN_RE.findall(name))
+    category_tokens = set(_SKILL_SEARCH_TOKEN_RE.findall(category))
+    for token in tokens:
+        if token in name_tokens:
+            score += 100
+        elif token in name:
+            score += 50
+        if token in category_tokens:
+            score += 30
+        elif token in category:
+            score += 15
+        if token in description:
+            score += 10
+    return score
+
+
+def skills_list(
+    category: str = None, query: str = None, limit: int = None, task_id: str = None,
+) -> str:
+    """Tier 1 discovery: optional category/query filters, then name + description."""
     try:
+        if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100):
+            return tool_error("limit must be an integer from 1 to 100", success=False)
         _skills_dir().mkdir(parents=True, exist_ok=True)
         all_skills = _find_all_skills()
         try:
@@ -254,12 +298,26 @@ def skills_list(category: str = None, task_id: str = None) -> str:
                           "message": "No skills found in skills/ directory."})
         if category:
             all_skills = [s for s in all_skills if s.get("category") == category]
-        all_skills = _sort_skills(all_skills)
+        if query and query.strip():
+            ranked = [(_skill_search_score(skill, query), skill) for skill in all_skills]
+            all_skills = [
+                skill for score, skill in sorted(
+                    (item for item in ranked if item[0] > 0),
+                    key=lambda item: (-item[0], item[1].get("category") or "", item[1]["name"]),
+                )
+            ]
+        else:
+            all_skills = _sort_skills(all_skills)
+        total_matches = len(all_skills)
+        effective_limit = limit if limit is not None else (10 if query and query.strip() else None)
+        if effective_limit is not None:
+            all_skills = all_skills[:effective_limit]
         categories = sorted({s.get("category") for s in all_skills if s.get("category")})
         return _json({
             "success": True, "skills": all_skills, "categories": categories,
-            "count": len(all_skills),
-            "hint": "Use skill_view(name) to see full content, tags, and linked files"})
+            "count": len(all_skills), "total_matches": total_matches,
+            "query": query.strip() if query and query.strip() else None,
+            "hint": "Load only a clear match with skill_view(name); refine query or category when results are broad."})
     except Exception as e:
         return tool_error(str(e), success=False)
 
@@ -599,14 +657,24 @@ def skill_view(
 
 SKILLS_LIST_SCHEMA = {
     "name": "skills_list",
-    "description": "List available skills (name + description). Use skill_view(name) to load full content.",
+    "description": "Search available skills by task, name, description, or category. Returns compact ranked candidates; load a clear match with skill_view(name).",
     "parameters": {
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
                 "description": "Optional category filter to narrow results",
-            }
+            },
+            "query": {
+                "type": "string",
+                "description": "Optional task or capability query; matching results are ranked by relevance",
+            },
+            "limit": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 100,
+                "description": "Maximum results (default 10 for a query; all for an unfiltered listing)",
+            },
         },
         "required": [],
     },
@@ -633,7 +701,9 @@ SKILL_VIEW_SCHEMA = {
 
 registry.register(
     name="skills_list", toolset="skills", schema=SKILLS_LIST_SCHEMA,
-    handler=lambda args, **kw: skills_list(category=args.get("category"), task_id=kw.get("task_id")),
+    handler=lambda args, **kw: skills_list(
+        category=args.get("category"), query=args.get("query"), limit=args.get("limit"), task_id=kw.get("task_id"),
+    ),
     check_fn=check_skills_requirements, emoji="📚")
 
 

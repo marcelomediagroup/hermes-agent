@@ -117,5 +117,20 @@ def test_skills_breakdown_attributes_demoted_category_shared_line(isolated_home)
         assert entry["index_line_skill_count"] == 2
 
 
+def test_skills_breakdown_attributes_router_names_line(isolated_home):
+    """Compact router mode remains visible in the prompt-size diagnostic."""
+    from agent.prompt_builder import build_skills_system_prompt
+
+    _seed_skill(isolated_home, "alpha-skill", "alpha description")
+    _seed_skill(isolated_home, "beta-skill", "beta description")
+    prompt = build_skills_system_prompt(index_mode="router")
+    skills_match = _SKILLS_BLOCK_RE.search(prompt)
+    assert skills_match is not None
+
+    entries = _compute_skills_breakdown(skills_match.group(0))
+
+    assert {entry["name"] for entry in entries} == {"alpha-skill", "beta-skill"}
+    assert all(entry["index_line_bytes"] > 0 for entry in entries)
+
 
 

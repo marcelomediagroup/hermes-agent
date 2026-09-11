@@ -225,6 +225,9 @@ def _supporting_files(loaded_skill: dict[str, Any], skill_dir: Path | None) -> l
     return supporting
 
 
+_SUPPORTING_FILE_PREVIEW_LIMIT = 12
+
+
 def _build_skill_message(
     loaded_skill: dict[str, Any],
     skill_dir: Path | None,
@@ -254,7 +257,12 @@ def _build_skill_message(
         except ValueError:
             skill_view_target = skill_dir.name  # external dir — use the skill name
         parts += ["", "[This skill has supporting files (paths relative to the skill directory above):]"]
-        parts += [f"- {sf}" for sf in supporting]
+        parts += [f"- {sf}" for sf in supporting[:_SUPPORTING_FILE_PREVIEW_LIMIT]]
+        if len(supporting) > _SUPPORTING_FILE_PREVIEW_LIMIT:
+            parts.append(
+                f"- … {len(supporting) - _SUPPORTING_FILE_PREVIEW_LIMIT} more files omitted; "
+                "use skill_view with a task-specific path from the root skill."
+            )
         parts.append(
             f'\nLoad any of these with skill_view(name="{skill_view_target}", '
             f'file_path="<path>"), or run scripts directly by absolute path '

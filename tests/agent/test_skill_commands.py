@@ -748,6 +748,20 @@ class TestSkillDirectoryHeader:
         assert f"[Skill directory: {skill_dir}]" in msg
         assert f"node {skill_dir}/scripts/foo.js" in msg
 
+    def test_supporting_file_inventory_is_bounded(self, tmp_path):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            skill_dir = _make_skill(tmp_path, "large-skill")
+            references = skill_dir / "references"
+            references.mkdir()
+            for index in range(20):
+                (references / f"guide-{index:02}.md").write_text("reference")
+            scan_skill_commands()
+            msg = build_skill_invocation_message("/large-skill")
+
+        assert msg is not None
+        assert msg.count("- references/guide-") == 12
+        assert "8 more files omitted" in msg
+
 
 class TestTemplateVarSubstitution:
     """``${HERMES_SKILL_DIR}`` and ``${HERMES_SESSION_ID}`` in SKILL.md body

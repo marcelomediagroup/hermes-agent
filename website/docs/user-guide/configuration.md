@@ -738,6 +738,23 @@ See [Code Execution](features/code-execution.md) and the [Terminal section of th
 
 Skills can declare their own configuration settings via their SKILL.md frontmatter. These are non-secret values (paths, preferences, domain settings) stored under the `skills.config` namespace in `config.yaml`.
 
+For large catalogs, control what Hermes places in the stable system-prompt
+prefix with `skills.prompt_index`:
+
+```yaml
+skills:
+  prompt_index: auto  # auto | router | full
+```
+
+- `auto` uses the compact router index for GPT-6 Astra and the full
+  name/description index for other models.
+- `router` includes category and skill names only, then lets the agent search
+  precisely with `skills_list(query=..., limit=...)`.
+- `full` includes every matching skill description for compatibility.
+
+The compact mode changes discovery, not availability. Exact slash commands and
+`skill_view` continue to work normally.
+
 ```yaml
 skills:
   config:
